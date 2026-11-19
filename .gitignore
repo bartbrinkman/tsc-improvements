@@ -1,0 +1,39 @@
+# --- IP guard: nothing derived from the game may be committed ---------------
+# Local reverse-engineering notes, disassembly, signatures with real bytes.
+research/
+# Raw measurement output (contains module offsets of game code).
+captures/
+# Downloaded third-party tools.
+.tools/
+
+# Binaries of any kind (game files must never be copied into this tree).
+*.exe
+*.dll
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.obj
+*.etl
+*.dmp
+*.idb
+*.i64
+*.id0
+*.id1
+*.nam
+*.til
+*.gpr
+*.rep
+*.bndb
+
+# Build output
+build/
+out/
+.vs/
+__pycache__/
+*.pyc
+
+.venv/
+
+# Research-only proxy code that embeds engine knowledge (see docs/IP-POLICY.md).
+proxy/research_*

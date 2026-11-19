@@ -1,0 +1,53 @@
+#!/bin/sh
+# IP guard: refuse commits that could carry material derived from the game.
+# See docs/IP-POLICY.md. Bypassing this hook (--no-verify) is not allowed.
+
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+for f in $staged; do
+    case "$f" in
+        research/*|captures/*|.tools/*)
+            echo "ip-guard: $f is in a local-only folder"; fail=1; continue ;;
+        *.exe|*.dll|*.pdb|*.etl|*.dmp|*.idb|*.i64|*.bndb|*.gpr)
+            echo "ip-guard: $f is a binary/analysis artefact"; fail=1; continue ;;
+    esac
+
+    # Binary content (git reports '-' for numstat of binary blobs).
+    if git diff --cached --numstat -- "$f" | grep -q '^-'; then
+        echo "ip-guard: $f is binary"; fail=1; continue
+    fi
+
+    # Large files are suspicious in a source-only repo.
+    size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+    if [ "$size" -gt 524288 ]; then
+        echo "ip-guard: $f is larger than 512 KiB"; fail=1; continue
+    fi
+
+    # Vendored open-source code (e.g. MinHook's decoder tables) is not game material.
+    case "$f" in third_party/*) continue ;; esac
+
+    added=$(git diff --cached -U0 -- "$f" | grep '^+' | grep -v '^+++')
+
+    # Literal byte sequences: "48 8B 05 ?? ..", "0x48, 0x8B, ..", "\x48\x8b..".
+    if printf '%s\n' "$added" | grep -Eq '([0-9A-Fa-f?]{2}[ ,]+){12,}[0-9A-Fa-f?]{2}|(0x[0-9A-Fa-f]{2},[[:space:]]*){12,}|(\\x[0-9A-Fa-f]{2}){12,}'; then
+        echo "ip-guard: $f contains what looks like a raw byte pattern"; fail=1
+    fi
+
+    # Disassembly listings.
+    if printf '%s\n' "$added" | grep -Eiq '^\+?[[:space:]]*[0-9a-f]{8,16}[: ]+[[:space:]]*(mov|lea|call|jmp|push|sub|cmp|test)[[:space:]]'; then
+        echo "ip-guard: $f contains what looks like a disassembly listing"; fail=1
+    fi
+
+    # Concrete offsets into the game's modules.
+    if printf '%s\n' "$added" | grep -Eiq '(GameManager[A-Za-z0-9_]*|RailWorks[A-Za-z0-9_]*)(\.dll|\.exe)?[[:space:]]*\+[[:space:]]*(0x)?[0-9a-f]{3,}'; then
+        echo "ip-guard: $f contains a module+offset into game code"; fail=1
+    fi
+done
+
+if [ $fail -ne 0 ]; then
+    echo
+    echo "Commit blocked by the IP guard. Move game-derived material to research/."
+    exit 1
+fi
+exit 0
