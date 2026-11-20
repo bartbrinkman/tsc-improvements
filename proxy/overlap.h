@@ -91,6 +91,8 @@ struct ForkHooks {
     void (*slot)();    // (measurement) game thread, at the forked module's place in the engine's order when it was started ahead
 };
 void SetForkHooks(const ForkHooks& hooks);
+// Called on the game thread right after the shadow pass has joined (the worker is idle).
+void SetShadowJoinedHook(void (*hook)());
 // (measurement) Called on the game thread right before it runs a render module itself, with the
 // module's class name.
 void SetModuleBeginHook(void (*hook)(const char* className));

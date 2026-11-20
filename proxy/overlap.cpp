@@ -182,8 +182,12 @@ bool Deferred(void** vt) {
     return false;
 }
 
-// (glitch isolation switches) Modules that join the shadow pass first even if allowed beside it.
-volatile bool g_joinScenery = false, g_joinConsist = false;
+// Modules that join the shadow pass first even if allowed beside it.
+// [threading] consist_beside_shadows (default 0): the consist manager (the trains) waits for the
+// shadow pass. Skinned train bodies get their skeleton palette from the shadow pass's draw; the
+// worker defers it to the join (pipeline.cpp, SkeletonPalette). Drawn beside the shadow pass, the
+// trains used palettes that were not made yet: parked SLT bodies vanished (20 Nov, Haarlem).
+volatile bool g_joinScenery = false, g_joinConsist = true;
 bool ForcedJoin(void** vt) {
     if (!g_joinScenery && !g_joinConsist) return false;
     const char* name = ClassName(vt);
@@ -345,6 +349,8 @@ struct JoinStat {
 JoinStat g_joinStats[16];
 int g_joinStatCount = 0;
 
+void (*g_shadowJoinedHook)() = nullptr;
+
 void Join(const char* why) {
     if (!g_overlapping) return;
     LARGE_INTEGER t0, t1, t2;
@@ -366,9 +372,13 @@ void Join(const char* why) {
     while (i < g_joinStatCount && strncmp(g_joinStats[i].why, why, sizeof g_joinStats[i].why - 1)) ++i;
     if (i == g_joinStatCount && g_joinStatCount < 16) strncpy_s(g_joinStats[g_joinStatCount++].why, why, _TRUNCATE);
     if (i < g_joinStatCount) ++g_joinStats[i].count, g_joinStats[i].ticks += t1.QuadPart - t2.QuadPart;
+    if (g_shadowJoinedHook) g_shadowJoinedHook();
 }
 
 void JoinFromDevice() { Join("device call"); }
+}  // namespace
+void SetShadowJoinedHook(void (*hook)()) { g_shadowJoinedHook = hook; }
+namespace {
 
 // [experiments] overlap_core: the worker gets the last physical core to itself (both its
 // logical processors) and the game thread stays off it, so the two never share a core.
@@ -761,6 +771,7 @@ bool InstallOverlap(const char* allowList) {
         if (!g_skipModules.empty()) Log("overlap: not drawing %zu render module name(s) (glitch isolation)", g_skipModules.size());
     }
     g_forkName = fork;
+    g_joinConsist = tscfix::config::Int("threading", "consist_beside_shadows", 0, ini) == 0;
     g_forkEarly = tscfix::config::Int("experiments", "overlap_fork_early", 1, ini) != 0;
     char after[96];
     tscfix::config::Str("experiments", "overlap_fork_after", "0", after, sizeof after, ini);

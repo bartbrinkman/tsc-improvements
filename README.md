@@ -35,10 +35,12 @@ Steam's "Verify integrity of game files" does not remove the mod. You must delet
   - Numbers on signs no longer flicker.
   - The cab view is fixed to the cab. It no longer sways slowly when the train stands still. The head movement while driving is also gone.
   - A braked train that stands still now stays fully still.
+  - Far signal lenses no longer flicker while the train stands.
+  - Parked trains no longer lose their car bodies when you drive past them.
 - **Picture changes.**
   - With supersampling on, the picture is made smaller with a sharper filter, and the game's FXAA blur is off.
   - The game's bloom and colour step is replaced by the mod's own.
-  - Lamp light gets weaker in daylight.
+  - Lamp light gets weaker in daylight. It no longer changes brightness from moment to moment.
 - **Clearer crash messages.** When the game stops, the message tells you what happened. The full record is in `tscfix.log`.
 
 ## Settings

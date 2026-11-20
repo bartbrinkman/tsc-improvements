@@ -3,6 +3,8 @@
 #include <MinHook.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
@@ -10,6 +12,7 @@
 
 #include <tlhelp32.h>
 
+#include "engine_sites.h"
 #include "log.h"
 #include "sites.h"
 
@@ -656,37 +659,61 @@ void HeadSpring(void* camera) {
 // holds a bogie (no traction, brake on, brake force left over, brake stronger than the gradient's
 // pull) for half a second, the bogie is kept at the pose it had then, with zero velocity, until
 // one of those stops being true (power, brake released, gradient); while all bogies of a consist are
-// held, its car bodies are kept too. The actor calls use the PhysX
+// held, its car bodies are kept too. A hold starts only when the actor stands (below 0.05 m/s), and
+// it ends when the actor moved more than 5 mm in one step all the same. The actor calls use the PhysX
 // 2.8 NxActor vtable (slots checked against the game's own calls: getGlobalPose 9, setGlobalPose
 // 5, getLinearVelocity 58; getMass 46 reads the bogie's mass).
 namespace {
 constexpr sites::Fingerprint kForceStep = {0xf8c0380b0bfcddf0ull, 16};  // (bogie, force state)
 constexpr sites::Fingerprint kConsistStep = {0xf75cae00456c8d57ull, 16};  // (consist, flag): reads the actors' poses
 constexpr int kSetGlobalPose = 5, kGetGlobalPose = 9, kSetLinearVelocity = 56, kSetAngularVelocity = 57;
+// (58 is the slot the consist_watch slot check above reads the linear velocity through, with this
+// same signature: the vector comes back through the second argument.)
+constexpr int kGetLinearVelocity = 58;
 constexpr int kHoldSteps = 30;  // steps the brake must hold before the pose is kept (0.5 s at 60 Hz)
-struct Held { void* actor; int steps; bool holding; ULONGLONG seen; float pose[12]; };
+constexpr float kHoldSpeed = 0.05f;  // m/s: a hold starts only below this speed
+constexpr float kHoldSlip = 0.005f;  // m: a held actor that moved further than this in one step is let go
+// In g_bodies, `steps` counts the frames the actor was seen in a consist without the force step
+// taking it, and `bogie` says the force step did take it (see ConsistHold).
+struct Held { void* actor; int steps; bool holding, bogie; ULONGLONG seen; float pose[12]; };
 constexpr int kHeldSlots = 512;  // power of two
 Held g_held[kHeldSlots];
-volatile LONG g_holds = 0, g_releases = 0;
+volatile LONG g_holds = 0, g_releases = 0, g_slips = 0;
 ForceStepFn g_holdStep = nullptr;
 
 Held g_bodies[kHeldSlots];  // the other actors of held consists (car bodies)
 
+// An entry for a new actor starts empty (no hold, no pose): an actor address that is used again
+// must not get the hold of the actor that had it before.
+void Fresh(Held& h, void* actor, ULONGLONG now) {
+    h = Held{};
+    h.actor = actor, h.seen = now;
+}
 Held* HeldIn(Held* table, void* actor, bool add) {
+    if (!actor) return nullptr;  // (a null actor would match an empty slot)
     size_t at = (reinterpret_cast<uintptr_t>(actor) >> 4) * 0x9E3779B97F4A7C15ull >> 55;
+    ULONGLONG now = GetTickCount64();
+    Held* old = nullptr;
     for (int probe = 0; probe < 16; ++probe) {
         Held& h = table[(at + probe) & (kHeldSlots - 1)];
         if (h.actor == actor) {
             // An entry not touched for a second belongs to an actor that is gone; its address may
             // have been reused: start over.
-            ULONGLONG now = GetTickCount64();
-            if (now - h.seen > 1000) h.steps = 0, h.holding = false;
+            if (now - h.seen > 1000) Fresh(h, actor, now);
             h.seen = now;
             return &h;
         }
-        if (!h.actor) return add ? (h.actor = actor, h.seen = GetTickCount64(), &h) : nullptr;
+        if (!h.actor) {
+            if (add) Fresh(h, actor, now);
+            return add ? &h : nullptr;
+        }
+        if (!old && now - h.seen > 1000) old = &h;
     }
-    return nullptr;  // (full: that actor is not held)
+    // No free slot in reach. Entries are never emptied (a hole would hide the entries behind it), so
+    // the first one whose actor has not been seen for a second is taken over.
+    if (!add || !old) return nullptr;  // (full: that actor is not held)
+    Fresh(*old, actor, now);
+    return old;
 }
 Held* HeldFor(void* actor) { return HeldIn(g_held, actor, true); }
 
@@ -697,13 +724,77 @@ void Keep(void* actor, const float* pose) {
     reinterpret_cast<void (*)(void*, const float*)>(vt[kSetLinearVelocity])(actor, zero);
     reinterpret_cast<void (*)(void*, const float*)>(vt[kSetAngularVelocity])(actor, zero);
 }
+// The actor stands (a braked bogie that still rolls must not be stopped dead).
+bool Slow(void* actor) {
+    float v[3] = {};
+    void** vt = *reinterpret_cast<void***>(actor);
+    reinterpret_cast<float* (*)(void*, float*)>(vt[kGetLinearVelocity])(actor, v);
+    return v[0] * v[0] + v[1] * v[1] + v[2] * v[2] < kHoldSpeed * kHoldSpeed;
+}
+// The actor is no longer where the hold put it one step ago (pose: 3 x 3 rotation, then the
+// position). The creep the hold is for is far below a millimetre per step, so something else moves
+// the vehicle: a coupling impact, a turntable, another loco that pulls. The hold must give way.
+bool Slipped(void* actor, const float* held) {
+    float now[12] = {};
+    void** vt = *reinterpret_cast<void***>(actor);
+    reinterpret_cast<void* (*)(void*, float*)>(vt[kGetGlobalPose])(actor, now);
+    float x = now[9] - held[9], y = now[10] - held[10], z = now[11] - held[11];
+    return !(x * x + y * y + z * z <= kHoldSlip * kHoldSlip);
+}
 
 // Once per frame, before the consist reads its actors' poses (consist +0x1b0: its actors, begin and
 // end): while every bogie of the consist is held, its other actors (the car bodies, which hang on
 // the bogies) are kept at the pose they had when the hold began, so the drawn train and the cab
 // camera do not move at all.
+// An actor counts as a car body only after it was in a consist for kHoldSteps frames in a row
+// without the force step taking it. A bogie that is missing from g_held (no room in the table) is
+// marked in g_bodies by the force step and is never held as a body; while a consist has such a
+// bogie, nothing of it is held here.
 using ConsistFn = void (*)(void* consist, char flag);
 ConsistFn g_consistStep = nullptr;
+
+// (diagnosis) [experiments] consist_life=1: every consist's life as the consist update sees it:
+// when it first updates, when its number of actors changes, and when it stops updating (gone for
+// 0.5 s), with its first body's position (consist +0x138: 64 bytes per body, position at 48).
+bool g_consistLife = false;
+struct Life {
+    void* consist;
+    ULONGLONG first, last;
+    int actors;
+    float at[3];
+};
+Life g_life[256];
+ULONGLONG g_lifeScan = 0;
+void NoteLife(void* consist, int actors) {
+    ULONGLONG now = GetTickCount64();
+    float at[3] = {};
+    uint8_t* poses = nullptr;
+    if (SafeRead(static_cast<uint8_t*>(consist) + 0x138, &poses, 8) && poses) SafeRead(poses + 48, at, sizeof at);
+    Life* free = nullptr;
+    Life* me = nullptr;
+    for (Life& l : g_life) {
+        if (l.consist == consist) { me = &l; break; }
+        if (!l.consist && !free) free = &l;
+    }
+    if (!me && free) {
+        *free = {consist, now, now, actors, {at[0], at[1], at[2]}};
+        Log("consist life: %p appears with %d actors at (%.0f, %.0f, %.0f)", consist, actors, at[0], at[1], at[2]);
+    } else if (me) {
+        if (me->actors != actors)
+            Log("consist life: %p has %d actors, was %d, at (%.0f, %.0f, %.0f)", consist, actors, me->actors, at[0], at[1], at[2]);
+        me->last = now, me->actors = actors;
+        memcpy(me->at, at, sizeof at);
+    }
+    if (now - g_lifeScan < 100) return;
+    g_lifeScan = now;
+    for (Life& l : g_life)
+        if (l.consist && now - l.last > 500) {
+            Log("consist life: %p gone (no update for %llu ms; lived %.1f s, %d actors, last at (%.0f, %.0f, %.0f))", l.consist,
+                static_cast<unsigned long long>(now - l.last), (l.last - l.first) / 1000.0, l.actors, l.at[0], l.at[1], l.at[2]);
+            l = {};
+        }
+}
+
 void ConsistHold(void* consist, char flag) {
     for (auto& c : g_consists) {  // (for the consist_watch diagnosis)
         void* v = c;
@@ -712,25 +803,50 @@ void ConsistHold(void* consist, char flag) {
     }
     void** be[2] = {};
     if (SafeRead(static_cast<uint8_t*>(consist) + 0x1b0, be, sizeof be) && be[0] && be[1] > be[0] && be[1] - be[0] <= 64) {
-        int bogies = 0, holding = 0;
-        for (void** at = be[0]; at < be[1]; ++at)
-            if (Held* h = HeldIn(g_held, *at, false)) ++bogies, holding += h->holding;
-        bool held = bogies > 0 && holding == bogies;
+        int bogies = 0, holding = 0, unknown = 0;
+        for (void** at = be[0]; at < be[1]; ++at) {
+            Held* b = HeldIn(g_bodies, *at, false);
+            if (Held* h = HeldIn(g_held, *at, false)) {
+                ++bogies, holding += h->holding;
+                if (b) b->steps = 0, b->holding = false;  // (a bogie: it does not count up towards "car body")
+            } else if (b && b->bogie) {
+                ++bogies;  // a bogie the table has no room for: it is not held, so the consist is not
+            } else if (!b && *at) {
+                ++unknown;  // in neither table (both full): it may be a bogie, so the consist is not held
+            }
+        }
+        bool held = bogies > 0 && holding == bogies && unknown == 0;
         for (void** at = be[0]; at < be[1]; ++at) {
             if (!*at || HeldIn(g_held, *at, false)) continue;
-            Held* b = HeldIn(g_bodies, *at, held);
-            if (!b) continue;
+            Held* b = HeldIn(g_bodies, *at, true);
+            if (!b || b->bogie) continue;
+            if (b->steps < kHoldSteps) {  // not known as a car body yet
+                ++b->steps, b->holding = false;
+                continue;
+            }
             if (!held) {
                 b->holding = false;
                 continue;
             }
             if (!b->holding) {
+                if (!Slow(*at)) continue;
                 void** vt = **reinterpret_cast<void****>(at);
                 reinterpret_cast<void* (*)(void*, float*)>(vt[kGetGlobalPose])(*at, b->pose);
                 b->holding = true;
+            } else if (Slipped(*at, b->pose)) {
+                // Something moves the body: it stays where it is now, and it is held again only
+                // after kHoldSteps more frames.
+                b->holding = false, b->steps = 0;
+                if (InterlockedIncrement(&g_slips) <= 8) Log("physicsfix: brake hold released, car body %p moved", *at);
+                continue;
             }
             Keep(*at, b->pose);
         }
+    }
+    if (g_consistLife) {
+        void** life[2] = {};
+        int n = SafeRead(static_cast<uint8_t*>(consist) + 0x1b0, life, sizeof life) && life[0] && life[1] >= life[0] ? static_cast<int>(life[1] - life[0]) : -1;
+        NoteLife(consist, n);
     }
     g_consistStep(consist, flag);
 }
@@ -742,7 +858,12 @@ void BrakeHold(int64_t* bogie, float* state) {
     void* actor = nullptr;
     if (!bogie[1] || !SafeRead(reinterpret_cast<uint8_t*>(bogie[1]) + 8, &actor, 8) || !actor) return;
     Held* h = HeldFor(actor);
-    if (!h) return;
+    if (!h) {
+        // No room in the table: this bogie is not held. ConsistHold must know, or it would take the
+        // actor for a car body.
+        if (Held* b = HeldIn(g_bodies, actor, true)) b->bogie = true, b->holding = false;
+        return;
+    }
     // state[2] after the step: the brake force the game's law did not need (it holds the bogie).
     bool holds = traction == 0 && brake > 0 && state[2] != 0 && brake > grade * mass * 9.81f;
     if (!holds) {
@@ -754,15 +875,30 @@ void BrakeHold(int64_t* bogie, float* state) {
     void** vt = *reinterpret_cast<void***>(actor);
     if (!h->holding) {
         if (++h->steps < kHoldSteps) return;
+        if (!Slow(actor)) {  // braked but still rolling: ask again at the next step
+            h->steps = kHoldSteps - 1;
+            return;
+        }
         reinterpret_cast<void* (*)(void*, float*)>(vt[kGetGlobalPose])(actor, h->pose);
         h->holding = true;
         if (InterlockedIncrement(&g_holds) <= 8) Log("physicsfix: brake holds bogie %p (mass %.1f)", actor, mass);
+    } else if (Slipped(actor, h->pose)) {
+        // Something else moves the vehicle. The old pose is not put back, and the brake must hold
+        // for kHoldSteps steps again, at a standstill, before the next hold.
+        h->steps = 0, h->holding = false;
+        if (InterlockedIncrement(&g_slips) <= 8)
+            Log("physicsfix: brake hold released, bogie %p moved more than %.0f mm in one step", actor, kHoldSlip * 1000.0f);
+        return;
     }
     Keep(actor, h->pose);
 }
 }  // namespace
 
 bool InstallBrakeHold(HMODULE engine) {
+    char ini[MAX_PATH];
+    GetModuleFileNameA(nullptr, ini, MAX_PATH);
+    if (char* slash = strrchr(ini, 0x5c)) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - ini), "tscfix.ini");
+    g_consistLife = GetPrivateProfileIntA("experiments", "consist_life", 0, ini) != 0;
     MH_Initialize();
     void* target = sites::Find(engine, kForceStep);
     bool ok = target && MH_CreateHook(target, reinterpret_cast<void*>(&BrakeHold), reinterpret_cast<void**>(&g_holdStep)) == MH_OK &&
@@ -803,6 +939,204 @@ bool InstallCabCamera(HMODULE engine, int springPercent, int dampingPercent, boo
     Log("physicsfix: cab camera spring hook %s (spring %d%%, damping %d%%%s)", ok ? "installed" : "NOT installed", springPercent,
         dampingPercent, spring ? "" : ", no spring");
     return ok;
+}
+
+// Camera rest. With the train held (brake_hold) the cab camera still moves by about 15 micrometres
+// and 2e-7 rad per frame. That changes the last float digits of the world-view-projection matrix,
+// and for a mesh with two faces in the same place (a signal lamp lens) those digits decide which
+// face wins the depth test: the lens flickers, also in the unchanged game.
+// [fixes] camera_rest: the cab camera's update (cCabCameraUpdate, slot 7 calls it) writes its new
+// transform with cPosOri's set-matrix function (iPosOri slot 25: a 4 x 4 float matrix, rotation in
+// elements 0 to 11, position in 12 to 14). While that update runs on this thread, the set-matrix
+// call is given the rest matrix in place of a new matrix that differs from it by less than
+// camera_rest_um micrometres and camera_rest_turn_ppm millionths per rotation element. A matrix
+// outside that goes through unchanged and becomes the candidate; the candidate becomes the rest
+// matrix after kRestFrames calls in a row that stayed that close to it. So a moving camera is never
+// held, and a train that starts to creep is let go after at most camera_rest_um.
+// Set-matrix calls outside the cab camera's update (every other entity, every other camera) are
+// passed on untouched.
+namespace {
+constexpr sites::Fingerprint kCabCameraUpdate = {0x3226f2687ae1f795ull, 16};  // (camera): the cab camera's per-frame update
+constexpr int kRestFrames = 15;        // calls in a row near the candidate before it becomes the rest matrix
+constexpr ULONGLONG kRestGapMs = 500;  // no call for this long: the rest matrix is forgotten
+constexpr int kRestSlots = 4;          // objects whose matrix is set inside the update (the camera's own, in practice)
+using CameraUpdateFn = void (*)(void* camera);
+using SetMatrixFn = void (*)(void* posOri, const float* matrix);
+CameraUpdateFn g_cameraUpdate = nullptr;
+SetMatrixFn g_setMatrix = nullptr;
+volatile bool g_restActive = false;
+volatile DWORD g_restThread = 0;  // the thread that is inside the cab camera's update (0: none)
+bool g_restLog = false, g_restUsed = false;
+float g_restMove = 0.0003f, g_restTurn = 0.00002f;  // metres; per rotation element
+
+struct Rest {
+    void* object;
+    ULONGLONG seen;
+    bool resting;  // rest[] is in use
+    int steady;    // calls in a row near cand[]
+    float rest[16], cand[16];
+};
+Rest g_rest[kRestSlots];
+// (all of these belong to the thread that runs the camera update)
+unsigned g_restUpdates = 0, g_restHeld = 0, g_restPassed = 0, g_restReleases = 0, g_restOther = 0;
+float g_restMaxMove = 0, g_restMaxTurn = 0;
+unsigned g_restNowHeld = 0, g_restNowPassed = 0;  // set-matrix calls inside the update that runs now
+// For other threads (CameraRestState, the blend over time of postfx.cpp). Written by the thread
+// that runs the camera update, after each update.
+std::atomic<bool> g_restInstalled{false};
+std::atomic<unsigned> g_restStreak{0};        // updates in a row at rest (0: the last update passed through)
+std::atomic<ULONGLONG> g_restUpdateTick{0};   // GetTickCount64 of the last update (0: none yet)
+std::atomic<ULONGLONG> g_restPassedTick{0};   // GetTickCount64 of the last update that passed through (0: none yet)
+
+// The differences between two matrices: position distance and largest rotation element difference.
+// NaN in either matrix gives "not near" (the comparisons in Near fail).
+void Differ(const float* a, const float* b, float* move, float* turn) {
+    float t = 0;
+    for (int i = 0; i < 12; ++i) {
+        float d = a[i] - b[i];
+        if (d < 0) d = -d;
+        if (!(d <= t)) t = d;
+    }
+    float x = a[12] - b[12], y = a[13] - b[13], z = a[14] - b[14];
+    *move = sqrtf(x * x + y * y + z * z), *turn = t;
+}
+bool Near(float move, float turn) { return move <= g_restMove && turn <= g_restTurn; }
+
+Rest* RestFor(void* object, ULONGLONG now) {
+    Rest* oldest = &g_rest[0];
+    for (Rest& r : g_rest) {
+        if (r.object == object) {
+            if (now - r.seen > kRestGapMs) r.resting = false, r.steady = 0;
+            r.seen = now;
+            return &r;
+        }
+        if (r.seen < oldest->seen) oldest = &r;
+    }
+    // Another object (a camera change): it starts without a rest matrix, in the slot not used longest.
+    *oldest = Rest{};
+    oldest->object = object, oldest->seen = now;
+    return oldest;
+}
+
+void RestSetMatrix(void* posOri, const float* matrix) {
+    DWORD inside = g_restThread;
+    if (!inside || inside != GetCurrentThreadId() || !matrix) return g_setMatrix(posOri, matrix);
+    if (!g_restActive) {
+        if (g_restUsed) memset(g_rest, 0, sizeof g_rest), g_restUsed = false;  // switched off: start over when it comes back
+        ++g_restOther;
+        ++g_restNowPassed;
+        return g_setMatrix(posOri, matrix);
+    }
+    g_restUsed = true;
+    Rest* r = RestFor(posOri, GetTickCount64());
+    float move, turn;
+    if (r->resting) {
+        Differ(matrix, r->rest, &move, &turn);
+        if (Near(move, turn)) {
+            if (move > g_restMaxMove) g_restMaxMove = move;
+            if (turn > g_restMaxTurn) g_restMaxTurn = turn;
+            ++g_restHeld;
+            ++g_restNowHeld;
+            float same[16];  // (a copy: the engine never gets a pointer into the kept matrix)
+            memcpy(same, r->rest, sizeof same);
+            return g_setMatrix(posOri, same);
+        }
+        r->resting = false, r->steady = 0;
+        ++g_restReleases;
+    }
+    if (r->steady > 0 && (Differ(matrix, r->cand, &move, &turn), Near(move, turn))) {
+        if (++r->steady >= kRestFrames) {
+            // The candidate stood for kRestFrames calls: from this call on it is what the engine gets.
+            memcpy(r->rest, r->cand, sizeof r->rest);
+            r->resting = true;
+            ++g_restHeld;
+            ++g_restNowHeld;
+            float same[16];
+            memcpy(same, r->rest, sizeof same);
+            return g_setMatrix(posOri, same);
+        }
+    } else {
+        memcpy(r->cand, matrix, sizeof r->cand);
+        r->steady = 1;
+    }
+    ++g_restPassed;
+    ++g_restNowPassed;
+    g_setMatrix(posOri, matrix);
+}
+
+void RestCameraUpdate(void* camera) {
+    DWORD before = g_restThread;  // (0, or this thread when the update is entered again from inside itself)
+    DWORD self = GetCurrentThreadId();
+    bool outer = before != self;
+    if (outer) g_restNowHeld = g_restNowPassed = 0;
+    g_restThread = self;
+    g_cameraUpdate(camera);
+    g_restThread = before;
+    if (outer) {
+        // The update was at rest when each of its set-matrix calls got the rest matrix. An update
+        // with one call that passed through, or with no call at all, breaks the row at once.
+        ULONGLONG now = GetTickCount64();
+        if (g_restNowHeld > 0 && g_restNowPassed == 0) {
+            unsigned row = g_restStreak.load(std::memory_order_relaxed);
+            if (row < 1000000u) g_restStreak.store(row + 1, std::memory_order_release);
+        } else {
+            g_restStreak.store(0, std::memory_order_release);
+            g_restPassedTick.store(now, std::memory_order_release);
+        }
+        g_restUpdateTick.store(now, std::memory_order_release);
+    }
+    if (++g_restUpdates < 600) return;
+    if (g_restLog)
+        Log("camera rest: last 600 updates: %u at rest, %u passed through, %u releases, largest held difference %.1f um and %.2f ppm%s",
+            g_restHeld, g_restPassed, g_restReleases, g_restMaxMove * 1e6f, g_restMaxTurn * 1e6f,
+            g_restActive ? "" : " [off]");
+    if (g_restLog && g_restOther) Log("camera rest: %u set-matrix calls passed on while off", g_restOther);
+    g_restUpdates = g_restHeld = g_restPassed = g_restReleases = g_restOther = 0;
+    g_restMaxMove = g_restMaxTurn = 0;
+}
+}  // namespace
+
+bool InstallCameraRest(HMODULE engine, int restUm, int turnPpm, bool log) {
+    if (restUm < 0) restUm = 0;
+    if (turnPpm < 0) turnPpm = 0;
+    g_restMove = restUm * 1e-6f, g_restTurn = turnPpm * 1e-6f, g_restLog = log;
+    // The set-matrix function is in the engine site table. The table is resolved here, before the
+    // hooks below change the first bytes of two functions (a fingerprint reads those bytes).
+    uintptr_t setRva = engine::Resolved(engine)[engine::PosOriSetMatrix];
+    void* update = sites::Find(engine, kCabCameraUpdate);
+    if (!setRva || !update) {
+        Log("camera rest: NOT installed (%s not found)", !update ? "cab camera update" : "set-matrix function");
+        return false;
+    }
+    void* set = reinterpret_cast<uint8_t*>(engine) + setRva;
+    MH_Initialize();
+    // The set-matrix hook first: without the update hook it passes every call on.
+    bool ok = MH_CreateHook(set, reinterpret_cast<void*>(&RestSetMatrix), reinterpret_cast<void**>(&g_setMatrix)) == MH_OK &&
+              MH_EnableHook(set) == MH_OK &&
+              MH_CreateHook(update, reinterpret_cast<void*>(&RestCameraUpdate), reinterpret_cast<void**>(&g_cameraUpdate)) == MH_OK &&
+              MH_EnableHook(update) == MH_OK;
+    Log("camera rest: %s (within %d um and %d ppm, rest after %d frames%s)", ok ? "installed" : "NOT installed (hook failed)", restUm, turnPpm,
+        kRestFrames, log ? ", log on" : "");
+    g_restInstalled.store(ok, std::memory_order_release);
+    return ok;
+}
+
+void SetCameraRestActive(bool active) { g_restActive = active; }
+
+CameraRestInfo CameraRestState() {
+    CameraRestInfo info{};
+    if (!g_restInstalled.load(std::memory_order_acquire)) return info;
+    info.installed = true;
+    info.active = g_restActive;
+    // The row is read between the two reads of the update tick. When an update ended in between,
+    // the row can be of either update: the caller then gets the smaller claim (no row).
+    ULONGLONG tick = g_restUpdateTick.load(std::memory_order_acquire);
+    unsigned row = g_restStreak.load(std::memory_order_acquire);
+    info.passedTick = g_restPassedTick.load(std::memory_order_acquire);
+    if (g_restUpdateTick.load(std::memory_order_acquire) != tick) row = 0;
+    info.updateTick = tick;
+    info.restUpdates = info.active ? row : 0;
+    return info;
 }
 
 }  // namespace tscfix::physicsfix

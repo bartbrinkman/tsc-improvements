@@ -52,7 +52,7 @@ ModelLoadFn g_modelLoad = nullptr;
 
 int g_mode = 0;
 volatile bool g_active = true;
-DWORD g_thread = 0;
+volatile DWORD g_thread = 0;
 
 // When a model last changed (ended or loaded), by a hash of its address, on a clock that counts
 // those events. A collision only makes an entry look older than it is.
@@ -62,6 +62,11 @@ volatile LONG64 g_modelChanged[kModelSlots];
 size_t ModelSlot(const uint8_t* model) { return (reinterpret_cast<uintptr_t>(model) >> 4) * 0x9E3779B97F4A7C15ull >> 52; }
 void ModelChanged(const uint8_t* model) { g_modelChanged[ModelSlot(model)] = InterlockedIncrement64(&g_modelClock); }
 volatile LONG g_scriptClock = 0;
+// Counts every shape load of any model. Entries compare it as they compare the tree clock, so a
+// call learned on one model is learned again when any model loads its shape: the per-model slot
+// above tells only about the model the entry remembered, not about the model the call would find
+// now. (ModelEnd keeps to the per-model slot.)
+volatile LONG64 g_loadClock = 0;
 
 struct Entry {
     void* L;
@@ -71,7 +76,7 @@ struct Entry {
     uint8_t* model;
     uint32_t index;
     uint8_t shown;
-    LONG64 modelClock;
+    LONG64 modelClock, loadClock;
     LONG treeClock, scriptClock;
     char fn[40];
     char node[56];
@@ -89,11 +94,57 @@ struct Now {  // the call that runs now (game thread)
     uint32_t index = 0;
     uint8_t shown = 0;
     bool wouldChange = false;
+    uintptr_t stack = 0;  // where Enter's frame was on the stack (see Enter)
 };
 Now g_now;
 
 volatile LONG64 g_sets = 0, g_setsSame = 0, g_skipped = 0, g_learned = 0, g_notLearned = 0, g_ran = 0, g_verified = 0, g_verifyWrong = 0;
 volatile LONG64 g_staleModel = 0, g_staleTree = 0, g_staleScript = 0, g_stateDiffers = 0;
+volatile LONG64 g_abandoned = 0;  // calls that never came to Leave (a Lua error went through them)
+
+// Why a candidate call was not learned. One reason per call: the first that applies, in this order.
+enum Reason { kInnerCall, kNoSet, kManySets, kHasResult, kClockMoved, kReasons };
+volatile LONG64 g_reason[kReasons];
+// The function names of the calls that were not learned: at most 16 names. When all 16 are in use,
+// a new name takes the place of the name with the lowest count and starts from that count plus one
+// (so a frequent name always gets in; a count can be too high by the count it started from).
+struct Unlearned {
+    char fn[40];
+    char node[56];  // the node of the last such call (an example)
+    LONG64 count, startedAt;
+    LONG64 reason[kReasons];
+};
+constexpr size_t kUnlearned = 16;
+Unlearned g_unlearned[kUnlearned];
+LONG64 g_unlearnedReplaced = 0;
+SRWLOCK g_unlearnedLock = SRWLOCK_INIT;  // written on the game thread, read by the log thread
+
+void NotLearned(const Entry& key, Reason reason) {
+    InterlockedIncrement64(&g_notLearned);
+    InterlockedIncrement64(&g_reason[reason]);
+    AcquireSRWLockExclusive(&g_unlearnedLock);
+    Unlearned* at = nullptr;
+    Unlearned* lowest = &g_unlearned[0];
+    for (Unlearned& u : g_unlearned) {
+        if (u.count && strcmp(u.fn, key.fn) == 0) {
+            at = &u;
+            break;
+        }
+        if (u.count < lowest->count) lowest = &u;
+    }
+    if (!at) {
+        at = lowest;
+        if (at->count) ++g_unlearnedReplaced;
+        LONG64 start = at->count;
+        *at = Unlearned{};
+        memcpy(at->fn, key.fn, sizeof at->fn);
+        at->count = at->startedAt = start;
+    }
+    ++at->count;
+    ++at->reason[reason];
+    memcpy(at->node, key.node, sizeof at->node);
+    ReleaseSRWLockExclusive(&g_unlearnedLock);
+}
 
 void SetNode(uint8_t* model, uint32_t index, uint8_t shown) {
     uint8_t* shape;
@@ -119,6 +170,7 @@ void* ModelEnd(uint8_t* model, uint32_t flags) {
 }
 void ModelLoad(uint8_t* model) {
     ModelChanged(model);
+    InterlockedIncrement64(&g_loadClock);
     g_modelLoad(model);
 }
 
@@ -172,11 +224,25 @@ void Census(void* L, const char* node, double value) {
 int Enter(void* L, ToStringFn toString) {
     if (!g_mode || !L) return kPass;
     DWORD me = GetCurrentThreadId();
-    if (!g_thread) g_thread = me;
+    if (!g_thread)  // (the first thread claims it, once)
+        InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_thread), static_cast<LONG>(me), 0);
     if (me != g_thread) return kPass;
-    if (g_now.verdict != kPass) {  // a script call inside a script call: the outer one is not learned
-        g_now.spoiled = true;
-        return kPass;
+    // The stack grows down, so a call inside the call that runs now has its frame at a lower
+    // address than that call's. A Lua error leaves the script call without Leave, and the verdict
+    // stays set. The rule: a set verdict counts as "a call runs now" only while this frame is
+    // below the frame that set it. A frame at the same address or above it shows that the old
+    // call's frame is gone: the old state is dropped (never learned) and this call starts fresh.
+    // An old verdict can outlive calls that come in deeper than it was; they pass as before, and
+    // the first call at its depth or above drops it.
+    volatile char mark = 0;
+    uintptr_t stack = reinterpret_cast<uintptr_t>(&mark);
+    if (g_now.verdict != kPass) {
+        if (stack < g_now.stack) {  // a script call inside a script call: the outer one is not learned
+            g_now.spoiled = true;
+            return kPass;
+        }
+        g_now = Now{};
+        InterlockedIncrement64(&g_abandoned);
     }
     uint8_t* top;
     uint8_t* base;
@@ -220,10 +286,11 @@ int Enter(void* L, ToStringFn toString) {
     Entry& e = g_entries[(hash >> 36) & (kSlots - 1)];
     g_now = Now{};
     g_now.slot = &e;
+    g_now.stack = stack;
     bool known = e.L == L && e.fnAt == fn && e.nodeAt == node && e.value == value && e.model && memcmp(e.fn, fn, fnLength + 1) == 0 &&
                  memcmp(e.node, node, nodeLength + 1) == 0;
     if (known) {
-        if (g_modelChanged[ModelSlot(e.model)] > e.modelClock) InterlockedIncrement64(&g_staleModel), known = false;
+        if (g_modelChanged[ModelSlot(e.model)] > e.modelClock || g_loadClock != e.loadClock) InterlockedIncrement64(&g_staleModel), known = false;
         else if (entitysearch::TreeChanges() != e.treeClock) InterlockedIncrement64(&g_staleTree), known = false;
         else if (g_scriptClock != e.scriptClock) InterlockedIncrement64(&g_staleScript), known = false;
         else if (!NothingToDo(e)) InterlockedIncrement64(&g_stateDiffers), known = false;
@@ -239,7 +306,7 @@ int Enter(void* L, ToStringFn toString) {
     Entry& k = g_now.key;
     k.L = L, k.fnAt = fn, k.nodeAt = node, k.value = value;
     memcpy(k.fn, fn, fnLength + 1), memcpy(k.node, node, nodeLength + 1);
-    k.modelClock = g_modelClock, k.treeClock = entitysearch::TreeChanges(), k.scriptClock = g_scriptClock;
+    k.modelClock = g_modelClock, k.loadClock = g_loadClock, k.treeClock = entitysearch::TreeChanges(), k.scriptClock = g_scriptClock;
     return g_now.verdict = kLearn;
 }
 
@@ -261,11 +328,13 @@ void Leave(int verdict, int results) {
         return;
     }
     // Learn: exactly one set, no results, no script call inside, and nothing in the clocks moved during the call.
-    if (now.spoiled || now.sets != 1 || results != 0 || now.key.treeClock != entitysearch::TreeChanges() || now.key.scriptClock != g_scriptClock ||
-        g_modelChanged[ModelSlot(now.model)] > now.key.modelClock) {
-        InterlockedIncrement64(&g_notLearned);
-        return;
-    }
+    if (now.spoiled) return NotLearned(now.key, kInnerCall);
+    if (now.sets == 0) return NotLearned(now.key, kNoSet);
+    if (now.sets != 1) return NotLearned(now.key, kManySets);
+    if (results != 0) return NotLearned(now.key, kHasResult);
+    if (now.key.treeClock != entitysearch::TreeChanges() || now.key.scriptClock != g_scriptClock || now.key.loadClock != g_loadClock ||
+        g_modelChanged[ModelSlot(now.model)] > now.key.modelClock)
+        return NotLearned(now.key, kClockMoved);
     now.key.model = now.model, now.key.index = now.index, now.key.shown = now.shown;
     *now.slot = now.key;
     InterlockedIncrement64(&g_learned);
@@ -306,7 +375,28 @@ void LogUse() {
     Log("nodeskip: %lld skipped, %lld ran (%lld learned, %lld not learnable); verdicts dropped: model changed %lld, entity tree changed %lld, "
         "script bound again %lld, state differs %lld; all sets %lld, same value %lld",
         g_skipped, g_ran, g_learned, g_notLearned, g_staleModel, g_staleTree, g_staleScript, g_stateDiffers, g_sets, g_setsSame);
+    if (g_abandoned) Log("nodeskip: %lld calls did not come back (script error inside the call); their state was dropped", g_abandoned);
     if (g_mode == 1) Log("nodeskip: verify: %lld \"skip\" verdicts checked and right, %lld wrong", g_verified, g_verifyWrong);
+    // Why calls were not learned (one reason per call, the sum is "not learnable"), then the same per function name.
+    Log("nodeskip: not learned, by reason: script call inside %lld, no set %lld, more than one set %lld, result for the script %lld, "
+        "model, tree or script changed during the call %lld",
+        g_reason[kInnerCall], g_reason[kNoSet], g_reason[kManySets], g_reason[kHasResult], g_reason[kClockMoved]);
+    static LONG64 logged = -1;
+    if (logged == g_notLearned) return;
+    logged = g_notLearned;
+    Unlearned names[kUnlearned];
+    AcquireSRWLockShared(&g_unlearnedLock);
+    memcpy(names, g_unlearned, sizeof names);
+    LONG64 replaced = g_unlearnedReplaced;
+    ReleaseSRWLockShared(&g_unlearnedLock);
+    std::sort(names, names + kUnlearned, [](const Unlearned& a, const Unlearned& b) { return a.count > b.count; });
+    Log("nodeskip: not learned, by function name (at most %zu names, %lld names replaced; inner/no set/many sets/result/changed):", kUnlearned,
+        replaced);
+    for (const Unlearned& u : names) {
+        if (!u.count) break;
+        Log("nodeskip:   %lld (first %lld not counted here) %.39s: %lld/%lld/%lld/%lld/%lld, last node %.55s", u.count, u.startedAt, u.fn,
+            u.reason[kInnerCall], u.reason[kNoSet], u.reason[kManySets], u.reason[kHasResult], u.reason[kClockMoved], u.node);
+    }
 }
 
 }  // namespace tscfix::nodeskip

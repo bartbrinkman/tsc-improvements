@@ -533,7 +533,22 @@ struct SharedRenderLock {
                 YieldProcessor();
             }
         } else if (tscfix::overlap::Overlapping()) {
-            EnterTimed(cs, id);
+            if (!TryEnterCriticalSection(cs)) {
+                LockWaitTimer timer(id);
+                // The scenery thread draws the main view too, so it comes here. Same rule as for
+                // the shadow threads, with the test the first-use and service locks use: when the
+                // game thread holds the lock while it waits for this thread, this thread goes
+                // ahead without it. (For the game thread the test is never true: it waits.)
+                while (!TryEnterCriticalSection(cs)) {
+                    if (tscfix::overlap::GameThreadHoldsWhileWaitingForMe(cs)) {
+                        held = false;
+                        if (InterlockedIncrement(&g_lockBypasses) <= 5)
+                            Log("research overlap: shared render lock bypassed (game thread waits for this thread)");
+                        return;
+                    }
+                    SwitchToThread();
+                }
+            }
         } else {
             held = false;  // no worker: nothing to guard against
             return;
@@ -1431,7 +1446,8 @@ struct ParkReplay {
 // on the same depth value and the winner changes with the camera's slight drift: digits break up
 // from frame to frame (stock too). Their materials are the ones with texture overrides applied
 // (+0x14e, set for the main view only, between ApplyOverrides and RestoreOverrides). Those draws get
-// a small depth bias towards the camera; the next other material puts it back.
+// a small depth bias towards the camera; the next other material puts it back, and so does the end
+// of the override draw (SignBiasEnd).
 // [graphics] sign_text_depth_bias (depth steps of a 24-bit buffer, default 32; 0 = off), sign_text_slope_bias (x100, default 100).
 constexpr size_t kMaterialOverridden = 0x14e;
 float g_signBias = 0, g_signSlope = 0;
@@ -1464,6 +1480,21 @@ void SignTextBias(const uint8_t* m) {
     if (want && (InterlockedIncrement(&g_signBiasedDraws) & 0xffff) == 1)
         Log("pipeline: sign text depth bias: %ld material changes biased", g_signBiasedDraws);
 }
+// The override flag is set only inside the engine's override draw, so the bias is switched off
+// when that draw ends, on the thread that switched it on. Waiting for the next material draw on
+// this thread let the bias run on into what came next in the command stream: another thread's part
+// of it, or the next shadow pass. Both states go back to 0: the values they had are not known here,
+// and to read them from the device this thread would have to wait for the render thread's queue.
+struct SignBiasEnd {
+    ~SignBiasEnd() {
+        if (!t_signBiased) return;
+        t_signBiased = false;
+        IDirect3DDevice9* d = tscfix::d3d::GameDevice();
+        if (!d) return;
+        d->SetRenderState(D3DRS_DEPTHBIAS, 0);
+        d->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
+    }
+};
 void MaterialDraw(void* material, int pass, uint64_t arg, char changed) {
     auto* m = static_cast<uint8_t*>(material);
     if (g_signBias != 0 || g_signSlope != 0) SignTextBias(m);
@@ -1667,8 +1698,67 @@ void NodeVisibility(void* model, uint8_t visible, void* name) {
     if (overlapstate::ShadowRole()) return;
     g_nodeVisibility(model, visible, name);
 }
+// The skip lost one-time palettes: a model's animation setup (cAnimObjectRender) computes the
+// starting palette once, and when the shadow worker ran it first, the skeleton kept an empty
+// palette and the main view drew a skinned body with it collapsed (Haarlem, 20 Nov: the bodies of
+// parked SLT units vanished at their near level of detail, only the rigid end parts stayed; vanilla,
+// one thread and overlap=0 kept them). The worker still never writes the palette: it records the
+// call (with a copy of the world matrix) and the game thread makes it right after the shadow pass
+// has joined. Per-frame calls give the values the main view writes anyway.
+struct PaletteCall {
+    void* skeleton;
+    float world[16];
+};
+constexpr int kPaletteCalls = 4096;
+PaletteCall g_paletteCalls[kPaletteCalls];
+volatile LONG g_paletteCallCount = 0;
+volatile LONG g_paletteDeferred = 0, g_paletteReplayed = 0, g_paletteDropped = 0, g_paletteFirst = 0;
+// A palette never computed: the skeleton's palette (+0x48) starts with the world matrix, whose last
+// element is 1 once it was written. A new skeleton (a model that just switched to its near level of
+// detail) has none yet, and the main view would draw it before the join (one frame without the
+// body, 20 Nov run with the deferred calls only). Such a palette is made at once on the worker:
+// nobody else writes it yet.
+bool PaletteNeverMade(void* skeleton) {
+    __try {
+        const float* palette = *reinterpret_cast<float* const*>(static_cast<uint8_t*>(skeleton) + 0x48);
+        return palette && palette[15] != 1.0f;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 void SkeletonPalette(void* skeleton, const void* world) {
-    if (!overlapstate::ShadowRole()) g_skeletonPalette(skeleton, world);
+    if (!overlapstate::ShadowRole()) return g_skeletonPalette(skeleton, world);
+    if (!skeleton || !world) return;
+    if (PaletteNeverMade(skeleton)) InterlockedIncrement(&g_paletteFirst);  // (counted only: making it here raced, 20 Nov)
+    LONG i = InterlockedIncrement(&g_paletteCallCount) - 1;
+    if (i >= kPaletteCalls) {
+        InterlockedIncrement(&g_paletteDropped);
+        return;
+    }
+    g_paletteCalls[i].skeleton = skeleton;
+    memcpy(g_paletteCalls[i].world, world, sizeof g_paletteCalls[i].world);
+    InterlockedIncrement(&g_paletteDeferred);
+}
+// Game thread, after the shadow pass joined (no worker draws now).
+void ReplayPalettes() {
+    LONG n = InterlockedExchange(&g_paletteCallCount, 0);
+    if (n > kPaletteCalls) n = kPaletteCalls;
+    // One call per skeleton, the last one recorded (newest first, a small open-address set).
+    static void* seen[8192];
+    memset(seen, 0, sizeof seen);
+    for (LONG i = n - 1; i >= 0; --i) {
+        void* s = g_paletteCalls[i].skeleton;
+        size_t h = (reinterpret_cast<uintptr_t>(s) >> 4) * 0x9E3779B97F4A7C15ull >> 51;
+        bool dup = false;
+        while (seen[h]) {
+            if (seen[h] == s) { dup = true; break; }
+            h = (h + 1) & 8191;
+        }
+        if (dup) continue;
+        seen[h] = s;
+        g_skeletonPalette(s, g_paletteCalls[i].world);
+        InterlockedIncrement(&g_paletteReplayed);
+    }
 }
 // A scenery object with numbers or swapped textures (signs, platform numbers) rebuilds its model's
 // replacement list at every draw: the list is emptied (its nodes freed) and filled again. The
@@ -1732,6 +1822,7 @@ volatile LONG g_overrideWindow[kOverrideLocks] = {};
 volatile LONG g_overrideRaces = 0, g_overrideMainNoRepl = 0;
 template <int K>
 void OverrideDraw(void* a, void* object, void* c, uint8_t d) {
+    SignBiasEnd biasEnd;  // (on every way out of this function)
     uint8_t* model = ModelWithOverrides(object);
     // (With the scenery thread there are two main-view threads: each takes the slot values the
     // model holds at that moment into its queue item, so a draw without replacements must stay out
@@ -2429,6 +2520,9 @@ void LogSeedReads() {
                 n += sprintf_s(line + n, sizeof line - n, " %s 0:%ld 1:%ld;", m.name, InterlockedExchange(&m.zero, 0), InterlockedExchange(&m.one, 0));
         if (n) Log("research overlap: shared light flag when the game thread starts a render module (value: times), last 600 passes:%s", line);
     }
+    Log("research overlap: skeleton palettes the shadow pass asked for, last 600 passes: %ld not made before (counted), %ld recorded, %ld made after the join, %ld dropped (list full)",
+        InterlockedExchange(&g_paletteFirst, 0), InterlockedExchange(&g_paletteDeferred, 0), InterlockedExchange(&g_paletteReplayed, 0),
+        InterlockedExchange(&g_paletteDropped, 0));
     LONG z0 = InterlockedExchange(&g_seedWasZero[0], 0), z1 = InterlockedExchange(&g_seedWasZero[1], 0);
     if (z0 || z1)
         Log("research overlap: the shared light flag was 0 when a pass took its start value, last 600 passes: %ld shadow passes, %ld scenery "
@@ -2598,6 +2692,7 @@ bool Install(HMODULE engine) {
     // only 55.5, hooks only 54.7, stock 53.9-58.3 fps), and switching them stutters ~100 ms.
     (void)&SetEngineHooks;
     tscfix::overlap::SetForkHooks({&ForkPrepare, &ForkEnter, &ForkLeave, &ForkCloseCaller, &ForkJoined, &ForkSlot});
+    tscfix::overlap::SetShadowJoinedHook(&ReplayPalettes);
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(engine);
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(reinterpret_cast<uint8_t*>(engine) + dos->e_lfanew);
     (void)nt;

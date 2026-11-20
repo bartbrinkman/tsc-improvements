@@ -43,6 +43,11 @@ While the render runs, nothing changes the world. So the render threads only nee
 - `proxy/overlapstate.cpp`, `proxy/pipeline.cpp`: render-state managers, sorted queues, instancing lists, material overrides, shadow flags.
 - `proxy/safecounts.cpp`: atomic user counts for objects that both threads touch.
 
+Some engine work that the shadow pass does is skipped on the worker:
+
+- Skeleton palettes (the bone matrices of skinned models) are recorded on the worker. The game thread makes them right after the shadow pass joins. Some skinned models (for example parked EMUs) get their palette only from the shadow pass.
+- For that reason the consist manager draws its trains only after the join. `[threading] consist_beside_shadows=1` lets it draw beside the shadow pass again. Then skinned train bodies can be drawn without a palette and disappear.
+
 Measured standing at Haarlem: 26.7 ms per frame, stock 39.0 ms. Results between game launches differ by up to 10%.
 
 ## Fixes (`[fixes]`)
@@ -51,10 +56,12 @@ Measured standing at Haarlem: 26.7 ms per frame, stock 39.0 ms. Results between 
 |---|---|---|---|
 | `multicore` | 1 | Starts the engine's job threads, as the `-Multicore` option does. | `main.cpp` |
 | `brake_hold` | 1 | A bogie that the game's own brake law holds (no traction, brake on, brake stronger than the gradient) keeps its pose with zero velocity after 0.5 s. When all bogies of a consist are held, its car bodies are kept too. Without it, PhysX lets a braked standing train creep by millimetres, and the camera moves with it. | `physicsfix.cpp` |
+| `camera_rest` | 1 | While the cab camera's new transform differs from its rest transform by less than `camera_rest_um` (300 µm) and `camera_rest_turn_ppm` (20 millionths per rotation element), the rest transform is used bit for bit. A transform outside that becomes the new candidate; it becomes the rest transform after a few frames in a row near it. So a moving camera is never held. Far thin objects (signal lenses) then stay steady while the train stands. | `physicsfix.cpp` |
 | `engine_heap_budget` | 1 | The engine heap's budget is the machine's commit limit, not 2 GB. Small fixed heaps get 16 times their budget (at most 1 GB). The sound system heap gets 512 MB instead of 100 MB. | `main.cpp` |
 | `physics_index` | 1 | Removing a collideable no longer walks a list of all collideables (stutter when tiles unload). | `physicsfix.cpp` |
 | `entity_search_cache` | 1 | Script calls to `child:function` and `*:function` find their targets from a cache. The cache is cleared when any entity gains or loses a child. | `entitysearch.cpp` |
 | `node_set_skip` | 1 | An `ActivateNode` script call that changes nothing is skipped. Needs `entity_search_cache`. | `nodeskip.cpp` |
+| `fast_control_lookup` | 1 | A script call that names a control (`GetControlValue`, `SetControlValue`, `ControlExists` and others) gets the control from a remembered answer, not from a new engine string and a search by string compares. `[experiments] control_lookup_verify=1` runs the engine's lookup too and compares. | `controllookup.cpp` |
 | `script_call_cache` | 1 | The script `Call()` binding's lookup of its own entity is cached per Lua state. | `scriptcall.cpp` |
 | `qi_cache` | 1 | One interface query of entity containers is cached per thread. | `qicache.cpp` |
 | `script_timing` | 1 | Script call timing is skipped while its overlay is off. | `scripttiming.cpp` |
@@ -66,6 +73,7 @@ Measured standing at Haarlem: 26.7 ms per frame, stock 39.0 ms. Results between 
 | `fast_function_lookup` | 0 | A script call finds its engine function from an index. | `funclookup.cpp` |
 | `fast_node_lookup` | 0 | A model's node is found by name from an index. | `nodelookup.cpp` |
 | `fast_strings` | 0 | Faster engine string compare with the same results. | `fastpaths.cpp` |
+| `precise_load_clock` | 0 | The loading fibers' slice clock counts true milliseconds (from `QueryPerformanceCounter`), not the coarse system tick. | `loadclock.cpp` |
 
 ## Picture (`[graphics]`)
 
@@ -77,8 +85,9 @@ Measured standing at Haarlem: 26.7 ms per frame, stock 39.0 ms. Results between 
 | `fxaa` | -1 | The game's FXAA pass: -1 off when the game supersamples, 0 off, 1 on. | `postfx.cpp` |
 | `film` | 1 | Bloom and tone: 0 the game's pass, 1 the mod's, 2 the mod's strong one. | `postfx.cpp` |
 | `depth_of_field` | 1 | The game's depth of field pass. | `postfx.cpp` |
-| `lamp_fade` | 1 | Lamp light and lamp glow get weaker as the scene gets bright, between `lamp_fade_from_percent` (25) and `lamp_fade_to_percent` (70) of scene brightness. | `postfx.cpp` |
+| `lamp_fade` | 1 | Lamp light and lamp glow get weaker as the scene gets bright, between `lamp_fade_from_percent` (25) and `lamp_fade_to_percent` (70) of scene brightness. The brightness is a slow average (about 30 s), so the light does not change with each frame. In full daylight 10% of the light stays. | `postfx.cpp` |
 | `anisotropy` | 0 | 0 keeps the game's level (4). Else 8 or 16. | `resolve.cpp` |
+| `blend_over_time` | 0 | While the camera stands, each frame also takes a part of the frame before (calms far thin lines). Not finished: off. | `postfx.cpp` |
 
 ## Other settings
 
@@ -135,7 +144,8 @@ Run `git config core.hooksPath githooks` after you clone. The pre-commit hook bl
 | `overlap.cpp`, `overlapstate.cpp`, `pipeline.cpp`, `binder.cpp`, `offload.cpp` | Render threading |
 | `rtdevice.cpp`, `rteffect.cpp`, `d3dlayer.cpp` | Direct3D wrapper and replay |
 | `resolve.cpp`, `postfx.cpp`, `psfade.cpp` | Picture changes |
-| `physicsfix.cpp` | Physics index, brake hold, cab camera |
-| `entitysearch.cpp`, `nodeskip.cpp`, `scriptcall.cpp`, `qicache.cpp`, `scripttiming.cpp`, `funclookup.cpp`, `nodelookup.cpp`, `lookup.cpp` | Script call speed-ups |
+| `physicsfix.cpp` | Physics index, brake hold, cab camera, camera rest |
+| `entitysearch.cpp`, `nodeskip.cpp`, `controllookup.cpp`, `scriptcall.cpp`, `qicache.cpp`, `scripttiming.cpp`, `funclookup.cpp`, `nodelookup.cpp`, `lookup.cpp` | Script call speed-ups |
 | `safecounts.cpp`, `cowtable.h` | Thread safety |
+| `loadclock.cpp` | Loading fibers' clock |
 | `flickercap.cpp`, `glitch.cpp`, `framelog.cpp`, `profiler.cpp`, `trace.cpp`, `telemetry.cpp`, `ab.cpp` | Measurement and diagnosis |

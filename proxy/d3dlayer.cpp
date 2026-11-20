@@ -22,6 +22,7 @@
 #include <atomic>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "postfx.h"
 #include "resolve.h"
@@ -219,7 +220,23 @@ HRESULT STDMETHODCALLTYPE SetTexture(IDirect3DDevice9* d, DWORD s, IDirect3DBase
         return Orig<decltype(&Name)>(kDev, Slot)(d, p);                                     \
     }
 TSCFIX_PTR_SETTER(SetVertexShader, kSetVertexShader, IDirect3DVertexShader9*, vs, vsKnown)
-TSCFIX_PTR_SETTER(SetPixelShader, kSetPixelShader, IDirect3DPixelShader9*, ps, psKnown)
+// The pixel shader: the picture passes of the mod (resolve.h, postfx.h) put their own shader in the
+// place of the game's first, as GlitchSetPS and SetPixelShaderResolve do. The filter then compares
+// the shader that goes to the runtime, not the one the game gave: two game shaders can get the
+// same replacement, and one game shader can get another replacement later. The substitution runs
+// at every set, also at a set that the filter skips: it keeps the passes' own state (which pass
+// is set now).
+HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DDevice9* d, IDirect3DPixelShader9* p) {
+    Count(kDev, kSetPixelShader);
+    p = postfx::Substitute(d, resolve::Substitute(d, p));
+    if (Filtering()) {
+        if (Known(g_s.psKnown) && g_s.ps == p) return Skipped(kSetPixelShader), D3D_OK;
+        HRESULT hr = Orig<decltype(&SetPixelShader)>(kDev, kSetPixelShader)(d, p);
+        if (SUCCEEDED(hr)) g_s.ps = p, g_s.psKnown = g_s.gen;
+        return hr;
+    }
+    return Orig<decltype(&SetPixelShader)>(kDev, kSetPixelShader)(d, p);
+}
 TSCFIX_PTR_SETTER(SetIndices, kSetIndices, IDirect3DIndexBuffer9*, ib, ibKnown)
 // (glitch detection) the same setters feeding the draw log, installed instead of the filtering
 // ones when glitch_detect is on and the state filter is off.
@@ -263,6 +280,7 @@ HRESULT STDMETHODCALLTYPE GlitchSetVSConstF(IDirect3DDevice9* d, UINT start, con
     return Orig<decltype(&GlitchSetVSConstF)>(kDev, 94)(d, start, data, count);
 }
 HRESULT STDMETHODCALLTYPE GlitchSetPSConstF(IDirect3DDevice9* d, UINT start, const float* data, UINT count) {
+    postfx::OnPixelConstants(start, data, count);
     glitch::NoteConstants(true, start, data, count);
     return Orig<decltype(&GlitchSetPSConstF)>(kDev, 109)(d, start, data, count);
 }
@@ -287,6 +305,7 @@ HRESULT STDMETHODCALLTYPE GlitchSetViewport(IDirect3DDevice9* d, const D3DVIEWPO
 }
 HRESULT STDMETHODCALLTYPE GlitchDrawIndexed(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT base, UINT minIndex, UINT verts,
                                             UINT start, UINT prims) {
+    postfx::OnDraw(d);
     if (glitch::CensusOnly()) {  // the device's own value, against the value the hooks followed
         DWORD real = 0;
         if (SUCCEEDED(d->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &real))) glitch::NoteRealSlope(real);
@@ -299,6 +318,7 @@ HRESULT STDMETHODCALLTYPE GlitchDrawIndexed(IDirect3DDevice9* d, D3DPRIMITIVETYP
 }
 // (pixel pick) the non-indexed draws too: full-screen passes and light volumes.
 HRESULT STDMETHODCALLTYPE GlitchDraw(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT start, UINT prims) {
+    postfx::OnDraw(d);
     glitch::NoteDraw(0, start, prims);
     bool pick = glitch::PickBegin(d);
     HRESULT hr = Orig<decltype(&GlitchDraw)>(kDev, 81)(d, t, start, prims);
@@ -365,6 +385,7 @@ HRESULT STDMETHODCALLTYPE SetVSConstF(IDirect3DDevice9* d, UINT start, const flo
 
 HRESULT STDMETHODCALLTYPE SetPSConstF(IDirect3DDevice9* d, UINT start, const float* data, UINT count) {
     Count(kDev, kSetPSConstF);
+    postfx::OnPixelConstants(start, data, count);  // (before the filter: a skipped call holds the same values)
     if (Filtering() && data) {
         if (ConstantsEqual(g_s.psc, g_s.pscKnown, start, data, count)) return Skipped(kSetPSConstF), D3D_OK;
         HRESULT hr = Orig<decltype(&SetPSConstF)>(kDev, kSetPSConstF)(d, start, data, count);
@@ -534,6 +555,34 @@ HRESULT STDMETHODCALLTYPE SetSamplerStateProbe(IDirect3DDevice9* d, DWORD sample
 HRESULT STDMETHODCALLTYPE SetRenderStatePostfx(IDirect3DDevice9* d, D3DRENDERSTATETYPE state, DWORD value) {
     return Orig<decltype(&SetRenderStatePostfx)>(kDev, kSetRenderState)(d, state, postfx::BlendValue(state, value));
 }
+// (blend over time) The camera of each frame is read from the constants of the game's sun light shader.
+HRESULT STDMETHODCALLTYPE SetPSConstFPostfx(IDirect3DDevice9* d, UINT start, const float* data, UINT count) {
+    postfx::OnPixelConstants(start, data, count);
+    return Orig<decltype(&SetPSConstFPostfx)>(kDev, kSetPSConstF)(d, start, data, count);
+}
+// (blend over time) The draw calls: the first one of the last pass reads the target of the pass
+// (postfx::OnDraw). A full-screen pass can use any of the four calls, so all four are hooked.
+HRESULT STDMETHODCALLTYPE DrawPostfx(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT start, UINT prims) {
+    Count(kDev, 81);
+    postfx::OnDraw(d);
+    return Orig<decltype(&DrawPostfx)>(kDev, 81)(d, t, start, prims);
+}
+HRESULT STDMETHODCALLTYPE DrawIndexedPostfx(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT base, UINT minIndex, UINT verts, UINT start, UINT prims) {
+    Count(kDev, 82);
+    postfx::OnDraw(d);
+    return Orig<decltype(&DrawIndexedPostfx)>(kDev, 82)(d, t, base, minIndex, verts, start, prims);
+}
+HRESULT STDMETHODCALLTYPE DrawUPPostfx(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT prims, const void* data, UINT stride) {
+    Count(kDev, 83);
+    postfx::OnDraw(d);
+    return Orig<decltype(&DrawUPPostfx)>(kDev, 83)(d, t, prims, data, stride);
+}
+HRESULT STDMETHODCALLTYPE DrawIndexedUPPostfx(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT minIndex, UINT verts, UINT prims, const void* indices, D3DFORMAT format,
+                                              const void* data, UINT stride) {
+    Count(kDev, 84);
+    postfx::OnDraw(d);
+    return Orig<decltype(&DrawIndexedUPPostfx)>(kDev, 84)(d, t, minIndex, verts, prims, indices, format, data, stride);
+}
 void SamplerProbeFrame(unsigned frame) {
     if (frame == 500) g_samplerProbe = 1;
     if (frame != 600 || g_samplerProbe != 1) return;
@@ -582,11 +631,13 @@ void NoteFrameTime() {
     last = now;
 }
 
+void LensPresent();
 HRESULT STDMETHODCALLTYPE Present(IDirect3DDevice9* d, const RECT* a, const RECT* b, HWND w, const RGNDATA* r) {
     Count(kDev, kPresent);
     NoteFrameTime();
     resolve::OnPresent(d);
     postfx::OnPresent(d);
+    LensPresent();  // before the capture, so the log line of a frame comes before the line of a capture that ends with it
     flickercap::OnPresent(d);
     static unsigned frames = 0, failures = 0;
     if (g_opt.samplerProbe) SamplerProbeFrame(frames + 1);
@@ -1098,9 +1149,333 @@ HRESULT STDMETHODCALLTYPE CreateQuery(IDirect3DDevice9* d, D3DQUERYTYPE t, IDire
     return hr;
 }
 
-// --- device instrumentation ----------------------------------------------------------------
 IDirect3DDevice9* g_device = nullptr;
 IDirect3DDevice9* g_gameDevice = nullptr;  // the device the engine got (the render thread's wrapper or the real one)
+
+// --- lens watch (diagnosis of the signal lens flicker at Haarlem, 2026-11-20) -----------------
+// The lens part of that signal head (234 triangles) and its body (12,048 triangles) use the same
+// shader and vertex buffer. At lens 2 three surfaces lie at the same place: two layers of the lens
+// part (inside one draw) and a group of body triangles. Which one wins a sample depends on the
+// rounding of the depth value, and that changes when the camera matrix changes in its last
+// digits, as it does while the train stands (see work-items/doing/zfight-wobble-haarlem.md).
+// [experiments] lens_watch=1: per frame, the samples that passed the depth test for each G-buffer
+// draw of lens_watch_tris_a / _b triangles (234 / 12048), with hashes of the second kind's vertex
+// shader constants. The device waits for each of those draws.
+// [experiments] lens_pick_key=VK with lens_pick_x/y/w/h (back buffer pixels) and lens_pick_frames:
+// a region pick (see LensPick). lens_pick_bias=N: in the second half of a pick the small part is
+// drawn with a depth bias of N steps.
+// [graphics] small_part_depth_bias (depth steps of a 24-bit buffer, default 0 = off),
+// small_part_slope_bias (x100), small_part_ratio (default 8), small_part_toggle_key: a test, not
+// a fix. In the G-buffer pass of the object shaders (Train*.fx, technique DEFERRED*), a draw with
+// at most 1/small_part_ratio of the triangles of the largest draw from the same vertex buffer
+// gets a depth bias towards the camera. With 32 steps and slope 1 the lens flicker stayed (two
+// of the surfaces are in one draw), a third of all object draws were biased, and the unlit lens
+// covered the lit lamp. Keep it off.
+int g_lensInit = 0, g_lensToggleKey = 0, g_lensWatch = 0;
+UINT g_lensTrisA = 0, g_lensTrisB = 0, g_lensRatio = 8;
+float g_lensBias = 0, g_lensSlope = 0;
+volatile bool g_lensOn = true;
+volatile LONG g_lensGen = 1;  // counts effect creations (the per-thread technique cache follows it)
+SRWLOCK g_lensLock = SRWLOCK_INIT;
+std::unordered_map<void*, bool> g_lensObject;  // effect -> an object shader (under g_lensLock)
+struct LensThread {
+    bool active = false;  // inside Begin/End of an object shader's G-buffer technique
+    LONG gen = 0;
+    struct Technique { bool active; const char* name; };
+    std::unordered_map<uint64_t, Technique> techniques;  // effect and technique -> active, name
+    void* fx = nullptr;
+    const char* technique = nullptr;
+    std::unordered_map<void*, UINT> largest[2];         // vertex buffer -> most triangles in one draw (this period, the one before)
+    unsigned draws = 0;
+};
+thread_local LensThread t_lens;
+struct LensDraw { UINT prims; DWORD px; bool biased; uint32_t hash[4]; };
+std::vector<LensDraw> g_lensDraws;
+DWORD g_lensThread = 0;
+unsigned g_lensActiveDraws = 0, g_lensBiasedDraws = 0;
+IDirect3DQuery9* g_lensQuery = nullptr;
+int g_lensPickKey = 0, g_lensPickPerPress = 0, g_lensPickFrames = 0, g_lensPickBias = 0;
+RECT g_lensPickRect{};
+void LensInit() {
+    if (g_lensInit) return;
+    g_lensInit = 1;
+    char ini[MAX_PATH];
+    GetModuleFileNameA(nullptr, ini, MAX_PATH);
+    if (char* slash = strrchr(ini, 0x5c)) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - ini), "tscfix.ini");
+    g_lensBias = -static_cast<int>(GetPrivateProfileIntA("graphics", "small_part_depth_bias", 0, ini)) / 16777216.0f;
+    g_lensSlope = -static_cast<int>(GetPrivateProfileIntA("graphics", "small_part_slope_bias", 0, ini)) / 100.0f;
+    g_lensRatio = GetPrivateProfileIntA("graphics", "small_part_ratio", 8, ini);
+    if (g_lensRatio < 2) g_lensRatio = 2;
+    g_lensToggleKey = GetPrivateProfileIntA("graphics", "small_part_toggle_key", 0, ini);
+    if (!g_lensToggleKey) g_lensToggleKey = GetPrivateProfileIntA("experiments", "small_part_toggle_key", 0, ini);  // the same switch for test runs
+    g_lensWatch = GetPrivateProfileIntA("experiments", "lens_watch", 0, ini);
+    g_lensTrisA = GetPrivateProfileIntA("experiments", "lens_watch_tris_a", 234, ini);
+    g_lensTrisB = GetPrivateProfileIntA("experiments", "lens_watch_tris_b", 12048, ini);
+    g_lensPickKey = GetPrivateProfileIntA("experiments", "lens_pick_key", 0, ini);
+    g_lensPickPerPress = GetPrivateProfileIntA("experiments", "lens_pick_frames", 30, ini);
+    g_lensPickBias = GetPrivateProfileIntA("experiments", "lens_pick_bias", 0, ini);
+    g_lensPickRect.left = GetPrivateProfileIntA("experiments", "lens_pick_x", 0, ini);
+    g_lensPickRect.top = GetPrivateProfileIntA("experiments", "lens_pick_y", 0, ini);
+    g_lensPickRect.right = g_lensPickRect.left + GetPrivateProfileIntA("experiments", "lens_pick_w", 1, ini);
+    g_lensPickRect.bottom = g_lensPickRect.top + GetPrivateProfileIntA("experiments", "lens_pick_h", 1, ini);
+    Log("small parts: depth bias %g, slope %g, for draws of at most 1/%u of their model's largest; toggle key %d, watch %d", g_lensBias,
+        g_lensSlope, g_lensRatio, g_lensToggleKey, g_lensWatch);
+}
+bool LensWanted() {
+    LensInit();
+    return g_lensBias != 0 || g_lensSlope != 0 || g_lensWatch;
+}
+// Each effect file as it is created.
+void LensNoteEffect(void* fx, const char* file) {
+    if (!LensWanted()) return;
+    bool object = !_strnicmp(file, "Train", 5) && !strstr(file, "Flora") && !strstr(file, "ViewFacing") && !strstr(file, "SkyDome") &&
+                  !strstr(file, "Particle") && !strstr(file, "post") && !strstr(file, "Shadow");
+    AcquireSRWLockExclusive(&g_lensLock);
+    g_lensObject[fx] = object;
+    ReleaseSRWLockExclusive(&g_lensLock);
+    InterlockedIncrement(&g_lensGen);
+}
+struct LensTechniqueDesc { const char* name; UINT passes, annotations; };
+// After an effect's Begin (on the thread that drives the device).
+void LensBegin(void* fx) {
+    LensThread& t = t_lens;
+    if (t.gen != g_lensGen) t.gen = g_lensGen, t.techniques.clear();
+    void** vt = *static_cast<void***>(fx);
+    const char* h = reinterpret_cast<const char* (STDMETHODCALLTYPE*)(void*)>(vt[59])(fx);  // GetCurrentTechnique
+    uint64_t key = reinterpret_cast<uint64_t>(fx) * 31 ^ reinterpret_cast<uint64_t>(h);
+    auto it = t.techniques.find(key);
+    if (it == t.techniques.end()) {
+        AcquireSRWLockShared(&g_lensLock);
+        auto o = g_lensObject.find(fx);
+        bool object = o != g_lensObject.end() && o->second;
+        ReleaseSRWLockShared(&g_lensLock);
+        LensTechniqueDesc desc{};
+        bool named = SUCCEEDED(reinterpret_cast<HRESULT (STDMETHODCALLTYPE*)(void*, const char*, LensTechniqueDesc*)>(vt[5])(fx, h, &desc)) && desc.name;  // GetTechniqueDesc
+        if (!named) desc.name = nullptr;
+        bool active = object && named && !strncmp(desc.name, "DEFERRED", 8);
+        it = t.techniques.emplace(key, LensThread::Technique{active, desc.name}).first;
+    }
+    t.active = it->second.active, t.fx = fx, t.technique = it->second.name;
+}
+uint32_t LensHash(const float* p, int floats) {
+    uint32_t x = 2166136261u;
+    const auto* b = reinterpret_cast<const uint8_t*>(p);
+    for (int i = 0; i < floats * 4; ++i) x = (x ^ b[i]) * 16777619u;
+    return x;
+}
+// (lens watch) Region pick: for lens_pick_frames frames after the pick key, every indexed draw runs
+// under a scissor of the region lens_pick_x/y/w/h (back buffer pixels) inside an occlusion query;
+// each draw that puts samples there is logged in order, with its shader, depth states and transform.
+UINT g_lensBackW = 0;
+unsigned g_lensPickDraw = 0, g_lensFrame = 0;
+const char* FxFileName(void* fx);
+HRESULT LensPick(IDirect3DDevice9* d, D3DPRIMITIVETYPE ty, INT base, UINT minIndex, UINT verts, UINT start, UINT prims) {
+    using Fn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+    Fn orig = Orig<Fn>(kDev, 82);
+    ++g_lensPickDraw;
+    IDirect3DSurface9* rt = nullptr;
+    D3DSURFACE_DESC desc{};
+    if (SUCCEEDED(d->GetRenderTarget(0, &rt)) && rt) rt->GetDesc(&desc), rt->Release();
+    if (!g_lensBackW || desc.Width * 9 != desc.Height * 16 || desc.Width < g_lensBackW ||
+        (!g_lensQuery && FAILED(d->CreateQuery(D3DQUERYTYPE_OCCLUSION, &g_lensQuery))))
+        return orig(d, ty, base, minIndex, verts, start, prims);
+    LONG k = static_cast<LONG>(desc.Width / g_lensBackW);
+    RECT r{g_lensPickRect.left * k, g_lensPickRect.top * k, g_lensPickRect.right * k, g_lensPickRect.bottom * k}, old{};
+    DWORD enable = FALSE;
+    d->GetRenderState(D3DRS_SCISSORTESTENABLE, &enable);
+    d->GetScissorRect(&old);
+    d->SetScissorRect(&r);
+    d->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+    HRESULT hr = D3D_OK;
+    DWORD px = 0;
+    if ((prims == g_lensTrisA || prims == g_lensTrisB) && (ty == D3DPT_TRIANGLELIST || ty == D3DPT_TRIANGLESTRIP)) {
+        // The two parts triangle by triangle (the same result as one draw): which triangles put samples in the region.
+        // In the second half of the pick the small part is drawn with the depth bias lens_pick_bias (steps).
+        bool biased = prims == g_lensTrisA && g_lensPickBias && g_lensPickFrames <= g_lensPickPerPress / 2;
+        DWORD oldBias = 0;
+        float bias = -g_lensPickBias / 16777216.0f;
+        if (biased) d->GetRenderState(D3DRS_DEPTHBIAS, &oldBias), d->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<DWORD*>(&bias));
+        static char line[60000];
+        int n = sprintf_s(line, "lenstris: f %u #%u prims %u type %d bias %d |", g_lensFrame, g_lensPickDraw, prims, static_cast<int>(ty), biased ? g_lensPickBias : 0);
+        DWORD cull = D3DCULL_NONE;
+        d->GetRenderState(D3DRS_CULLMODE, &cull);
+        bool strip = ty == D3DPT_TRIANGLESTRIP;
+        for (UINT i = 0; i < prims; ++i) {
+            // (in a strip every second triangle has the other winding)
+            if (strip && cull != D3DCULL_NONE) d->SetRenderState(D3DRS_CULLMODE, (i & 1) ? (cull == D3DCULL_CW ? D3DCULL_CCW : D3DCULL_CW) : cull);
+            g_lensQuery->Issue(D3DISSUE_BEGIN);
+            hr = orig(d, D3DPT_TRIANGLELIST, base, minIndex, verts, strip ? start + i : start + 3 * i, 1);
+            g_lensQuery->Issue(D3DISSUE_END);
+            DWORD one = 0;
+            for (int k2 = 0; k2 < 100000 && g_lensQuery->GetData(&one, sizeof one, D3DGETDATA_FLUSH) == S_FALSE; ++k2) {}
+            if (one && n < 59900) n += sprintf_s(line + n, sizeof line - n, " %u:%lu", i, one);
+            px += one;
+        }
+        if (strip) d->SetRenderState(D3DRS_CULLMODE, cull);
+        if (biased) d->SetRenderState(D3DRS_DEPTHBIAS, oldBias);
+        Log("%s", line);
+    } else {
+        g_lensQuery->Issue(D3DISSUE_BEGIN);
+        hr = orig(d, ty, base, minIndex, verts, start, prims);
+        g_lensQuery->Issue(D3DISSUE_END);
+        for (int i = 0; i < 100000 && g_lensQuery->GetData(&px, sizeof px, D3DGETDATA_FLUSH) == S_FALSE; ++i) {}
+    }
+    d->SetRenderState(D3DRS_SCISSORTESTENABLE, enable);
+    d->SetScissorRect(&old);
+    if (px) {
+        DWORD zf = 0, zw = 0, ze = 0, bias = 0, cull = 0, ate = 0;
+        d->GetRenderState(D3DRS_ZFUNC, &zf), d->GetRenderState(D3DRS_ZWRITEENABLE, &zw), d->GetRenderState(D3DRS_ZENABLE, &ze);
+        d->GetRenderState(D3DRS_DEPTHBIAS, &bias), d->GetRenderState(D3DRS_CULLMODE, &cull), d->GetRenderState(D3DRS_ALPHATESTENABLE, &ate);
+        float c[16] = {};
+        d->GetVertexShaderConstantF(0, c, 4);
+        IDirect3DVertexBuffer9* vb = nullptr;
+        UINT offset = 0, stride = 0;
+        if (SUCCEEDED(d->GetStreamSource(0, &vb, &offset, &stride)) && vb) vb->Release();
+        IDirect3DBaseTexture9* tex = nullptr;
+        if (SUCCEEDED(d->GetTexture(0, &tex)) && tex) tex->Release();
+        const LensThread& t = t_lens;
+        Log("lenspick: f %u #%u type %d px %lu rt %u fx %s tech %s prims %u start %u vb %p tex %p z %lu/%lu/%lu bias %08lx cull %lu atest %lu | %.7g %.7g %.7g %.7g | %.7g %.7g %.7g %.7g | "
+            "%.7g %.7g %.7g %.7g | %.7g %.7g %.7g %.7g",
+            g_lensFrame, g_lensPickDraw, static_cast<int>(ty), px, desc.Width, t.fx ? FxFileName(t.fx) : "-", t.fx && t.technique ? t.technique : "-", prims, start,
+            static_cast<void*>(vb), static_cast<void*>(tex), ze, zf, zw, bias, cull, ate, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
+        if (prims == g_lensTrisA || prims == g_lensTrisB) {  // the whole input of the two parts, to compare frame against frame
+            static char line[6000];
+            float v[64] = {}, q[32] = {};
+            d->GetVertexShaderConstantF(0, v, 16);
+            d->GetPixelShaderConstantF(0, q, 8);
+            int n = sprintf_s(line, "lensstate: f %u prims %u px %lu vs", g_lensFrame, prims, px);
+            for (int i = 0; i < 64; ++i) n += sprintf_s(line + n, sizeof line - n, " %.9g", v[i]);
+            n += sprintf_s(line + n, sizeof line - n, " | ps");
+            for (int i = 0; i < 32; ++i) n += sprintf_s(line + n, sizeof line - n, " %.9g", q[i]);
+            uint32_t h = 2166136261u;
+            n += sprintf_s(line + n, sizeof line - n, " | rs");
+            for (int rs = 7; rs < 210; ++rs) {
+                DWORD x = 0;
+                if (FAILED(d->GetRenderState(D3DRENDERSTATETYPE(rs), &x))) x = 0;
+                h = (h ^ x) * 16777619u;
+                if (rs == 15 || rs == 24 || rs == 25 || rs == 27 || rs == 19 || rs == 20) n += sprintf_s(line + n, sizeof line - n, " %d=%lx", rs, x);
+            }
+            n += sprintf_s(line + n, sizeof line - n, " all=%08x | samplers", h);
+            for (DWORD st = 0; st < 4; ++st) {
+                IDirect3DBaseTexture9* t2 = nullptr;
+                if (SUCCEEDED(d->GetTexture(st, &t2)) && t2) t2->Release();
+                n += sprintf_s(line + n, sizeof line - n, " s%lu %p", st, static_cast<void*>(t2));
+                if (t2 && t2->GetType() == D3DRTYPE_TEXTURE) {  // the detail level a managed texture is held at (the engine streams textures)
+                    D3DSURFACE_DESC td{};
+                    static_cast<IDirect3DTexture9*>(t2)->GetLevelDesc(0, &td);
+                    n += sprintf_s(line + n, sizeof line - n, " lod %lu of %lu %ux%u fmt %d pool %d", t2->GetLOD(), t2->GetLevelCount(), td.Width, td.Height,
+                                   static_cast<int>(td.Format), static_cast<int>(td.Pool));
+                }
+                for (int y = 1; y <= 13; ++y) {
+                    DWORD x = 0;
+                    d->GetSamplerState(st, D3DSAMPLERSTATETYPE(y), &x);
+                    n += sprintf_s(line + n, sizeof line - n, " %lx", x);
+                }
+            }
+            IDirect3DVertexShader9* vsh = nullptr;
+            IDirect3DPixelShader9* psh = nullptr;
+            if (SUCCEEDED(d->GetVertexShader(&vsh)) && vsh) vsh->Release();
+            if (SUCCEEDED(d->GetPixelShader(&psh)) && psh) psh->Release();
+            sprintf_s(line + n, sizeof line - n, " | shaders %p %p base %d min %u verts %u", static_cast<void*>(vsh), static_cast<void*>(psh), base, minIndex, verts);
+            Log("%s", line);
+        }
+    }
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE LensDrawIndexed(IDirect3DDevice9* d, D3DPRIMITIVETYPE ty, INT base, UINT minIndex, UINT verts, UINT start, UINT prims) {
+    LensThread& t = t_lens;
+    postfx::OnDraw(d);
+    if (g_lensPickFrames > 0 && GetCurrentThreadId() == g_lensThread) return LensPick(d, ty, base, minIndex, verts, start, prims);
+    if (!t.active) return Orig<decltype(&LensDrawIndexed)>(kDev, 82)(d, ty, base, minIndex, verts, start, prims);
+    IDirect3DVertexBuffer9* vb = nullptr;
+    UINT offset = 0, stride = 0;
+    if (SUCCEEDED(d->GetStreamSource(0, &vb, &offset, &stride)) && vb) vb->Release();
+    if ((++t.draws & 0xfffff) == 0) t.largest[1].swap(t.largest[0]), t.largest[0].clear();  // forget buffers that are gone
+    UINT& now = t.largest[0][vb];
+    if (prims > now) now = prims;
+    UINT most = now;
+    auto before = t.largest[1].find(vb);
+    if (before != t.largest[1].end() && before->second > most) most = before->second;
+    bool bias = g_lensOn && vb && static_cast<uint64_t>(prims) * g_lensRatio <= most && (g_lensBias != 0 || g_lensSlope != 0);
+    bool watch = g_lensWatch && GetCurrentThreadId() == g_lensThread;
+    bool query = watch && (prims == g_lensTrisA || prims == g_lensTrisB) && g_lensDraws.size() < 64;
+    if (query && !g_lensQuery && FAILED(d->CreateQuery(D3DQUERYTYPE_OCCLUSION, &g_lensQuery))) query = false;
+    if (watch) ++g_lensActiveDraws, g_lensBiasedDraws += bias;
+    DWORD oldBias = 0, oldSlope = 0;
+    if (bias) {
+        if (FAILED(d->GetRenderState(D3DRS_DEPTHBIAS, &oldBias))) oldBias = 0;
+        if (FAILED(d->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &oldSlope))) oldSlope = 0;
+        d->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<DWORD*>(&g_lensBias));
+        d->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *reinterpret_cast<DWORD*>(&g_lensSlope));
+    }
+    if (query) g_lensQuery->Issue(D3DISSUE_BEGIN);
+    HRESULT hr = Orig<decltype(&LensDrawIndexed)>(kDev, 82)(d, ty, base, minIndex, verts, start, prims);
+    if (query) {
+        g_lensQuery->Issue(D3DISSUE_END);
+        LensDraw x{prims, 0, bias, {}};
+        for (int i = 0; i < 100000 && g_lensQuery->GetData(&x.px, sizeof x.px, D3DGETDATA_FLUSH) == S_FALSE; ++i) {}
+        if (prims == g_lensTrisB) {
+            float c[64] = {};
+            d->GetVertexShaderConstantF(0, c, 16);
+            for (int g = 0; g < 4; ++g) x.hash[g] = LensHash(c + g * 16, 16);
+            static std::unordered_map<uint64_t, int> seen;
+            uint64_t all = (static_cast<uint64_t>(LensHash(c, 32)) << 32) | LensHash(c + 32, 32);
+            if (seen.size() < 12 && seen.emplace(all, 0).second) {
+                char line[1600];
+                int n = sprintf_s(line, "small parts: watch constants %08x %08x %08x %08x:", x.hash[0], x.hash[1], x.hash[2], x.hash[3]);
+                for (int i = 0; i < 64; ++i) n += sprintf_s(line + n, sizeof line - n, " %.9g", c[i]);
+                Log("%s", line);
+            }
+        }
+        g_lensDraws.push_back(x);
+    }
+    if (bias) {
+        d->SetRenderState(D3DRS_DEPTHBIAS, oldBias);
+        d->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, oldSlope);
+    }
+    return hr;
+}
+void LensPresent() {
+    if (!LensWanted()) return;
+    static unsigned frame = 0;
+    static bool down = false;
+    ++frame;
+    if (g_lensToggleKey) {
+        bool now = (GetAsyncKeyState(g_lensToggleKey) & 0x8000) != 0;
+        if (now && !down) {
+            g_lensOn = !g_lensOn;
+            Log("small parts: depth bias %s (key), frame %u", g_lensOn ? "on" : "off", frame);
+        }
+        down = now;
+    }
+    if (!g_lensWatch) return;
+    g_lensThread = GetCurrentThreadId();
+    g_lensFrame = frame;
+    if (g_lensPickFrames > 0 && --g_lensPickFrames == 0) Log("lenspick: done at frame %u", frame);
+    g_lensPickDraw = 0;
+    if (g_lensPickKey && g_lensPickFrames == 0 && (GetAsyncKeyState(g_lensPickKey) & 0x8000)) {
+        IDirect3DSurface9* back = nullptr;
+        if (g_device && SUCCEEDED(g_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) && back) {
+            D3DSURFACE_DESC bd{};
+            back->GetDesc(&bd);
+            back->Release();
+            g_lensBackW = bd.Width;
+        }
+        g_lensPickFrames = g_lensPickPerPress;
+        Log("lenspick: key, %d frames from frame %u, back buffer width %u", g_lensPickFrames, frame + 1, g_lensBackW);
+    }
+    static char line[8192];
+    int n = sprintf_s(line, "lens: f %u bias %d draws %u biased %u |", frame, g_lensOn ? 1 : 0, g_lensActiveDraws, g_lensBiasedDraws);
+    for (const LensDraw& x : g_lensDraws) {
+        n += sprintf_s(line + n, sizeof line - n, " %u/%lu%s", x.prims, x.px, x.biased ? "b" : "");
+        if (x.prims == g_lensTrisB) n += sprintf_s(line + n, sizeof line - n, "/%08x.%08x.%08x.%08x", x.hash[0], x.hash[1], x.hash[2], x.hash[3]);
+    }
+    if (g_lensActiveDraws) Log("%s", line);
+    g_lensDraws.clear();
+    g_lensActiveDraws = g_lensBiasedDraws = 0;
+}
+
+// --- device instrumentation ----------------------------------------------------------------
 
 void PlanDeviceSlots() {
     auto want = [](int slot, void* fn) { g_devWant[slot] = fn; };
@@ -1111,6 +1486,8 @@ void PlanDeviceSlots() {
     // (The hooks below for the same slots take these over when they are on; they do the same substitutions.)
     if (g_opt.samplerProbe || resolve::Enabled()) want(kSetSamplerState, reinterpret_cast<void*>(&SetSamplerStateProbe));
     if (postfx::Enabled()) want(kSetRenderState, reinterpret_cast<void*>(&SetRenderStatePostfx));
+    if (postfx::CameraWanted()) want(kSetPSConstF, reinterpret_cast<void*>(&SetPSConstFPostfx));
+    if (LensWanted()) want(82, reinterpret_cast<void*>(&LensDrawIndexed));  // DrawIndexedPrimitive
     want(kReset, reinterpret_cast<void*>(&Reset));
     want(kCreateStateBlock, reinterpret_cast<void*>(&CreateStateBlock));
     want(kBeginStateBlock, reinterpret_cast<void*>(&BeginStateBlock));
@@ -1155,6 +1532,12 @@ void PlanDeviceSlots() {
         want(kCreateOffscreen, reinterpret_cast<void*>(&CreateOffscreenPlainSurface));
     }
     if (g_opt.renderThread >= 2) want(kCreateQuery, reinterpret_cast<void*>(&CreateQuery));
+    if (postfx::DrawWanted()) {  // (the lens and glitch hooks of slots 81 and 82 call postfx::OnDraw themselves)
+        if (!g_devWant[81]) want(81, reinterpret_cast<void*>(&DrawPostfx));           // DrawPrimitive
+        if (!g_devWant[82]) want(82, reinterpret_cast<void*>(&DrawIndexedPostfx));    // DrawIndexedPrimitive
+        if (!g_devWant[83]) want(83, reinterpret_cast<void*>(&DrawUPPostfx));         // DrawPrimitiveUP
+        if (!g_devWant[84]) want(84, reinterpret_cast<void*>(&DrawIndexedUPPostfx));  // DrawIndexedPrimitiveUP
+    }
     if (g_opt.census) {
         for (int i = 0; i < kDevSlots; ++i)
             if (!g_devWant[i]) g_devWant[i] = EmitThunk(kDev, i);
@@ -1446,6 +1829,10 @@ extern IDirect3DDevice9* g_device;
 int g_fxLeak = -1, g_fxRestore = 0;
 bool g_fxKeepSamplers = true;  // [fixes] effect_keep_samplers: End puts sampler states back (see FxSamplers)
 std::unordered_map<void*, std::string> g_fxFile;
+const char* FxFileName(void* fx) {
+    auto it = g_fxFile.find(fx);
+    return it == g_fxFile.end() ? "?" : it->second.c_str();
+}
 std::unordered_map<std::string, unsigned> g_fxLeaks;
 ULONGLONG g_fxLeakDump = 0;
 struct FxState { DWORD ss[16][14]; DWORD rs[210]; DWORD tss[8][33]; };
@@ -1526,12 +1913,15 @@ HRESULT STDMETHODCALLTYPE FxBegin(void* fx, UINT* passes, DWORD flags) {
     if (g_device && (++begins & 511) == 1) Rearm(g_device);
     if (g_opt.census) ++g_fxBeginFlags[flags & 7];
     if (NoSaveState()) flags |= 1;  // D3DXFX_DONOTSAVESTATE
-    return Orig<decltype(&FxBegin)>(kFx, kFxBegin)(fx, passes, flags);
+    HRESULT hr = Orig<decltype(&FxBegin)>(kFx, kFxBegin)(fx, passes, flags);
+    if (SUCCEEDED(hr) && g_lensInit && LensWanted()) LensBegin(fx);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE FxEnd(void* fx) {
     Count(kFx, kFxEnd);
     HRESULT hr = Orig<decltype(&FxEnd)>(kFx, kFxEnd)(fx);
+    t_lens.active = false, t_lens.fx = nullptr;
     if (t_fx.depth && --t_fx.depth == 0) {
         FxSamplers& f = t_fx;
         for (int k = 0; k < f.n; ++k)
@@ -1573,6 +1963,7 @@ HRESULT WINAPI CreateEffectFromFileA(void* dev, const char* file, const void* de
     if (pause) rt::ResumeRenderThread();
     if (SUCCEEDED(hr) && fx) {
         if (file) g_fxFile[*fx] = strrchr(file, 0x5c) ? strrchr(file, 0x5c) + 1 : file;
+        if (file) LensNoteEffect(*fx, strrchr(file, 0x5c) ? strrchr(file, 0x5c) + 1 : file);
         InstrumentEffect(*fx);
         if (g_opt.renderThread >= 2) *fx = rt::WrapEffect(*fx);
     }

@@ -13,5 +13,6 @@ void SetCrop(int x, int y, int width, int height);  // keep only this part of ea
 bool Enabled();
 void OnPresent(IDirect3DDevice9* device);  // before the real Present
 void OnReset();
+void Trigger();  // as a press of the key (from a detector)
 
 }  // namespace tscfix::flickercap

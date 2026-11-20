@@ -198,29 +198,48 @@ void NoteRenderTarget(UINT width, UINT height) {
 // Pixel shaders by address: 0 not seen, 1 other, 2 the shrink shader. The shader object that the
 // game sets is not the one whose creation the hook sees, so a shader is classed by its code the
 // first time it is set. A positive is checked again by its code size at each use (an address can
-// be used again after a release).
+// be used again after a release). An "other" is checked by its code size once per 256 sets: no
+// runtime call in the common case, and a shrink shader made later at the address of a released
+// shader is still found.
+// A shader has kClassProbe places in a row. With one place, two shaders in use on the same place
+// put each other out at every set (a copy of the code and a parse each time).
 constexpr size_t kClassSlots = 16384;  // power of two
+constexpr size_t kClassProbe = 4;
 struct Classed {
     IDirect3DPixelShader9* shader;
     uint8_t kind;
     uint32_t size;
+    uint8_t sets;  // (kind 1) sets since the code size was last compared
 };
 Classed g_classed[kClassSlots];
+unsigned g_classEvict = 0;  // which of the places is given up next
 volatile bool g_shrinkBound = false;       // the shader that is set now is the shrink shader (original or replacement)
 volatile bool g_replacementBound = false;
 volatile LONG g_sourceWidth = 0, g_sourceHeight = 0;  // the large picture: the texture at stage 0 while the shrink shader is set
 
 bool IsShrinkObject(IDirect3DPixelShader9* shader) {
     size_t at = (reinterpret_cast<uintptr_t>(shader) >> 4) * 0x9E3779B97F4A7C15ull >> 50;
-    Classed& c = g_classed[at & (kClassSlots - 1)];
-    if (c.shader == shader && c.kind == 1) return false;
+    Classed* found = nullptr;
+    Classed* empty = nullptr;
+    for (size_t n = 0; n < kClassProbe && !found; ++n) {
+        Classed& e = g_classed[(at + n) & (kClassSlots - 1)];
+        if (e.shader == shader) found = &e;
+        else if (!e.shader && !empty) empty = &e;
+    }
     UINT size = 0;
-    if (c.shader == shader && c.kind == 2) return SUCCEEDED(shader->GetFunction(nullptr, &size)) && size == c.size;
+    if (found) {
+        if (found->kind == 1 && ++found->sets != 0) return false;
+        if (SUCCEEDED(shader->GetFunction(nullptr, &size)) && size == found->size) return found->kind == 2;
+    }
+    // Not seen, or another shader at a known address: classed by its code. A shader whose code
+    // cannot be read is stored as "other" with size 0, so it does not cost a read at every set.
+    Classed& c = found ? *found : empty ? *empty : g_classed[(at + (g_classEvict++ & (kClassProbe - 1))) & (kClassSlots - 1)];
+    c = {shader, 1, 0, 0};
     if (FAILED(shader->GetFunction(nullptr, &size)) || size < 8 || size > (1u << 20)) return false;
     std::vector<DWORD> code(size / 4 + 2);
     if (FAILED(shader->GetFunction(code.data(), &size))) return false;
     bool shrink = IsShrinkShader(code.data());
-    c = {shader, static_cast<uint8_t>(shrink ? 2 : 1), size};
+    c = {shader, static_cast<uint8_t>(shrink ? 2 : 1), size, 0};
     if (shrink) Log("resolve: the game's shrink shader is in use (%u bytes)", size);
     return shrink;
 }

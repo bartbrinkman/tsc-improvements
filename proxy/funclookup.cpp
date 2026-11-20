@@ -1,6 +1,7 @@
 #include "funclookup.h"
 
 #include <MinHook.h>
+#include <tlhelp32.h>
 
 #include <cstdint>
 #include <cstring>
@@ -126,19 +127,95 @@ uint8_t* AllocNear(uint8_t* target, size_t size) {
     return nullptr;
 }
 
-// call rel32 to `stub`, then a nop, over the 6 bytes at `site`.
-bool Redirect(uint8_t* site, const uint8_t* stub) {
+// call rel32 to `stub`, then a nop, for the 6 bytes at `site`.
+struct Patch {
+    uint8_t* site;
+    uint8_t code[6];
+};
+bool Prepare(Patch& patch, uint8_t* site, const uint8_t* stub) {
     int64_t rel = stub - (site + 5);
     if (rel > INT32_MAX || rel < INT32_MIN) return false;
-    uint8_t code[6] = {0xe8, 0, 0, 0, 0, 0x90};
+    const uint8_t code[6] = {0xe8, 0, 0, 0, 0, 0x90};
     int32_t rel32 = static_cast<int32_t>(rel);
-    memcpy(code + 1, &rel32, 4);
-    DWORD old;
-    if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) return false;
-    memcpy(site, code, 6);
-    VirtualProtect(site, 6, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 6);
+    patch.site = site;
+    memcpy(patch.code, code, 6);
+    memcpy(patch.code + 1, &rel32, 4);
     return true;
+}
+
+// Writes the patches while no other thread of the process runs (the way MinHook installs a hook).
+// A thread that runs the function during the write could read half of the old 6 bytes and half of
+// the new. So the other threads are suspended first. A suspended thread can also stand inside
+// the 6 bytes (the component place is two instructions): its next instruction would start in the
+// middle of the new call. Then all threads run on for a moment and the write is tried again. A
+// thread that stands at the first byte, or that is inside the called function and returns to the
+// byte after the 6, runs right with the old and with the new bytes.
+//
+// Nothing between the first suspend and the last resume uses the heap or the log: a suspended
+// thread can hold their locks. A thread that starts after the list was made is not suspended (the
+// same limit as MinHook has).
+bool WritePatches(const Patch* patches, int count) {
+    constexpr int kMaxThreads = 1024, kTries = 50;
+    static DWORD ids[kMaxThreads];
+    static HANDLE threads[kMaxThreads];
+    for (int attempt = 0; attempt < kTries; ++attempt) {
+        int idCount = 0;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) return false;
+        THREADENTRY32 te{};
+        te.dwSize = sizeof te;
+        DWORD process = GetCurrentProcessId(), me = GetCurrentThreadId();
+        if (Thread32First(snapshot, &te)) {
+            do {
+                if (te.th32OwnerProcessID == process && te.th32ThreadID != me && idCount < kMaxThreads) ids[idCount++] = te.th32ThreadID;
+                te.dwSize = sizeof te;
+            } while (Thread32Next(snapshot, &te));
+        }
+        CloseHandle(snapshot);
+
+        int threadCount = 0;
+        bool inside = false;
+        for (int i = 0; i < idCount; ++i) {
+            HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, ids[i]);
+            if (!thread) continue;  // (ended since the list was made)
+            if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+                CloseHandle(thread);
+                continue;
+            }
+            threads[threadCount++] = thread;
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_CONTROL;
+            if (!GetThreadContext(thread, &context)) {
+                inside = true;  // not known where it stands: not written this time
+                continue;
+            }
+            for (int k = 0; k < count; ++k) {
+                auto site = reinterpret_cast<uintptr_t>(patches[k].site);
+                if (context.Rip > site && context.Rip < site + 6) inside = true;
+            }
+        }
+        bool written = false;
+        if (!inside) {
+            written = true;
+            for (int k = 0; k < count; ++k) {
+                DWORD old;
+                if (!VirtualProtect(patches[k].site, 6, PAGE_EXECUTE_READWRITE, &old)) {
+                    written = false;  // (an earlier patch stays: each one is complete on its own)
+                    break;
+                }
+                memcpy(patches[k].site, patches[k].code, 6);
+                VirtualProtect(patches[k].site, 6, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), patches[k].site, 6);
+            }
+        }
+        for (int i = 0; i < threadCount; ++i) {
+            ResumeThread(threads[i]);
+            CloseHandle(threads[i]);
+        }
+        if (!inside) return written;
+        Sleep(1);
+    }
+    return false;
 }
 
 }  // namespace
@@ -178,7 +255,8 @@ bool Install(HMODULE engine, bool verify) {
     *p++ = 0xff, *p++ = 0xe0;
     FlushInstructionCache(GetCurrentProcess(), stubs, 64);
     g_verify = verify;
-    bool ok = Redirect(fn + kSiteEntity, entityStub) && Redirect(fn + kSiteComponent, componentStub);
+    Patch patches[2];
+    bool ok = Prepare(patches[0], fn + kSiteEntity, entityStub) && Prepare(patches[1], fn + kSiteComponent, componentStub) && WritePatches(patches, 2);
     Log("funclookup: function tables %s%s", ok ? "start at the remembered entry" : "NOT redirected",
         verify ? " (verify: the engine's search runs in full)" : "");
     return ok;

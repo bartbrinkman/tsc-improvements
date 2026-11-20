@@ -13,6 +13,7 @@ namespace tscfix::flickercap {
 namespace {
 
 int g_key = 0;
+volatile LONG g_trigger = 0;
 int g_frames = 60;                 // pictures in the window
 std::vector<IDirect3DSurface9*> g_ring;
 unsigned g_next = 0, g_stored = 0;  // ring position, pictures stored so far (up to g_frames)
@@ -56,7 +57,6 @@ DWORD WINAPI WriteFiles(void* arg) {
         ++written;
     }
     Log("flicker capture: %d pictures written (oldest first) in %s", written, job->first.c_str());
-    MessageBeep(MB_OK);
     delete job;
     return 0;
 }
@@ -104,6 +104,7 @@ void SetCrop(int x, int y, int width, int height) {
     if (width > 0 && height > 0) g_crop = {x, y, x + width, y + height};
 }
 bool Enabled() { return g_key > 0; }
+void Trigger() { InterlockedExchange(&g_trigger, 1); }
 void OnReset() { Release(); }
 
 void OnPresent(IDirect3DDevice9* device) {
@@ -128,7 +129,11 @@ void OnPresent(IDirect3DDevice9* device) {
     }
     back->Release();
     bool down = (GetAsyncKeyState(g_key) & 0x8000) != 0;
-    if (down && !g_down && g_after < 0) g_after = g_frames / 3;  // a third of the window comes after the key
+    bool triggered = InterlockedExchange(&g_trigger, 0) != 0;
+    // (tools) A named event "tscfix-capture" set by a script works as a press, without key input.
+    static HANDLE event = CreateEventA(nullptr, FALSE, FALSE, "Local\\tscfix-capture");
+    if (event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0) triggered = true;
+    if (((down && !g_down) || triggered) && g_after < 0) g_after = g_frames / 3;  // a third of the window comes after the key
     g_down = down;
     if (g_after > 0) --g_after;
     else if (g_after == 0) {

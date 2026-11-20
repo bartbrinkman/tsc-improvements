@@ -12,6 +12,7 @@
 #include <cstring>
 #include <unordered_set>
 
+#include "controllookup.h"
 #include "log.h"
 #include "nodeskip.h"
 #include "sites.h"
@@ -83,6 +84,7 @@ void Insert(void* L, void* entity, void* script) {
 // Linear probing: deleting means re-inserting the rest of the cluster.
 void Evict(void* L) {
     nodeskip::ScriptChanged();
+    controllookup::PairsChanged();  // a pair of (Lua state, script) from before this is not used again
     if (!L) return;
     AcquireSRWLockExclusive(&g_lock);
     size_t i = SlotOf(L);
@@ -115,7 +117,7 @@ void* GlobalUserdata(void* L, const char* name) {
 int g_verifyEvery = 0;  // [experiments] script_call_verify: every Nth hit also does the real lookup
 volatile long g_verifyMismatches = 0;
 uint64_t g_staleVt = 0;
-int CallInner(void* L) {
+int CallInner(void* L, uintptr_t frame) {
     if (!g_active) return g_call(L);
     Entry e;
     bool found = Find(L, e);
@@ -155,6 +157,7 @@ int CallInner(void* L) {
     addRef(script);
     void* holder = script;
     auto** entity = static_cast<void***>(e.entity);
+    controllookup::SetCurrent(controllookup::Pair(L, e.script, frame));  // (Call() below puts the previous pair back)
     int r = reinterpret_cast<int (*)(void*, void*, void**)>((*entity)[0x88 / 8])(entity, name, &holder);
     release(script);
     return r;
@@ -164,7 +167,20 @@ int CallInner(void* L) {
 int Call(void* L) {
     int verdict = nodeskip::Enter(L, g_toString);
     if (verdict == nodeskip::kSkip) return 0;  // the call would change nothing and returns nothing
-    int r = CallInner(L);
+    // The control lookup (controllookup.h) reads the Lua stack of the call that runs now. The pair is
+    // known only on the path with the remembered entity and script; a call inside this one sets its own.
+    //
+    // A Lua error that goes through this function skips the restore below, and the pair of the call
+    // that ended stays set. The same rule as in nodeskip::Enter: the machine stack grows down, so
+    // a call that still runs has its frame above this one. A pair with its frame at this address
+    // or below it belongs to a call that is gone, and it is not put back. The control lookup has
+    // the same test for a lookup that comes before the next Call() (controllookup.h).
+    volatile char mark = 0;
+    uintptr_t frame = reinterpret_cast<uintptr_t>(&mark);
+    controllookup::Current outer = controllookup::SetCurrent({nullptr, nullptr});
+    if (outer.L && outer.frame <= frame) outer = {};
+    int r = CallInner(L, frame);
+    controllookup::SetCurrent(outer);
     nodeskip::Leave(verdict, r);
     return r;
 }
@@ -211,6 +227,7 @@ bool Install(HMODULE engine) {
         Log("scriptcall: engine functions not found (game version changed?); disabled");
         return false;
     }
+    controllookup::SetToString(g_toString);
     MH_Initialize();
     bool ok = MH_CreateHook(setup, reinterpret_cast<void*>(&Setup), reinterpret_cast<void**>(&g_setup)) == MH_OK &&
               MH_CreateHook(rebind, reinterpret_cast<void*>(&Rebind), reinterpret_cast<void**>(&g_rebind)) == MH_OK &&

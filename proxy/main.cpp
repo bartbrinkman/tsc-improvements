@@ -33,7 +33,9 @@
 #include "lookup.h"
 #include "luaprof.h"
 #include "flickercap.h"
+#include "controllookup.h"
 #include "funclookup.h"
+#include "loadclock.h"
 #include "nodelookup.h"
 #include "nodeskip.h"
 #include "postfx.h"
@@ -44,6 +46,7 @@
 #include "safecounts.h"
 #include "patches.h"
 #include "physicsfix.h"
+#include "schedwatch.h"
 #include "scripttiming.h"
 #include "fastpaths.h"
 #include "profiler.h"
@@ -157,6 +160,7 @@ struct Config {
     bool stateFilter = false;      // [fixes] state_filter: drop redundant Direct3D state calls
     bool physicsIndex = false;     // [fixes] physics_index: O(1) collideable removal (tile-unload stutter)
     bool abPhysics = false;
+    bool abCameraRest = false;     // [ab] feature=camera_rest ([fixes] camera_rest: the standing cab camera is kept bit for bit)
     bool scriptTiming = false;     // [fixes] script_timing: skip script call timing while its overlay is off
     bool scriptCallCache = false;  // [fixes] script_call_cache (research): Call() self lookup cached per Lua state
     bool abScriptCallCache = false;
@@ -169,6 +173,10 @@ struct Config {
     bool abFastStrings = false;
     bool fastNodeLookup = false;   // [fixes] fast_node_lookup: a model's node by name from a remembered index
     bool abNodeLookup = false;
+    bool abControlLookup = false;  // A/B feature control_lookup ([fixes] fast_control_lookup)
+    bool preciseLoadClock = false; // [fixes] precise_load_clock: the loading fibers' slice clock counts true milliseconds
+    bool abLoadClock = false;
+    bool fiberTime = false;        // [experiments] fiber_time: log the game thread's time in the loading fibers per frame
     bool abFunctionLookup = false;
     bool abNodeSetSkip = false;
     int collideableList = 0;       // local: list offset in the physics manager
@@ -182,6 +190,9 @@ struct Config {
     bool sceneryProbe = false;     // [experiments] scenery_probe: log scenery render calls per frame
     bool shadowCull = false;       // [experiments] shadow_cull: contribution culling of shadow casters (probe when A/B)
     bool abShadowCull = false;
+    bool abBlendOverTime = false;  // blend_over_time is under A/B control (installed, switched by the measurement window)
+    bool abGlowGain = false;       // glow_far_gain_percent is under A/B control
+    bool abSteadyGlow = false;     // steady_glow is under A/B control (installed, switched by the measurement window)
     shadowcull::Config cull;
     bool lookupProbe = false;      // [experiments] lookup_probe: log script child-call lookups per frame
     bool speedLimits = false;      // [experiments] speed_limits: publish the player's speed limits
@@ -647,6 +658,7 @@ DWORD WINAPI MemoryLogMain(void*) {
         SampleHeaps();
         funclookup::LogUse();
         nodeskip::LogUse();
+        controllookup::LogUse();
         if (second % 60 == 0) {  // one plain line per minute: how the game runs
             long frames, over50, over100, worst, activeMs;
             d3d::ReadFrameHealth(&frames, &over50, &over100, &worst, &activeMs);
@@ -814,6 +826,8 @@ void LoadConfig() {
     g_cfg.qiCache = tscfix::config::Int("fixes", "qi_cache", 1, path) != 0;
     g_cfg.fastStrings = tscfix::config::Int("fixes", "fast_strings", 0, path) != 0;
     g_cfg.fastNodeLookup = tscfix::config::Int("fixes", "fast_node_lookup", 0, path) != 0;
+    g_cfg.preciseLoadClock = tscfix::config::Int("fixes", "precise_load_clock", 0, path) != 0;
+    g_cfg.fiberTime = tscfix::config::Int("experiments", "fiber_time", 0, path) != 0;
     g_cfg.multicore = tscfix::config::Int("fixes", "multicore", 1, path) != 0;
     g_cfg.richPresence = tscfix::config::Int("fixes", "rich_presence_async", 1, path) != 0;
     g_cfg.collideableList = tscfix::config::Int("experiments", "collideable_list_field", 0, path);
@@ -900,6 +914,9 @@ void LoadConfig() {
         } else if (strcmp(f, "physics_index") == 0) {
             g_cfg.abPhysics = true;
             ab::Configure(f, period, &physicsfix::SetActive);
+        } else if (strcmp(f, "camera_rest") == 0) {
+            g_cfg.abCameraRest = true;
+            ab::Configure(f, period, &physicsfix::SetCameraRestActive);
         } else if (strcmp(f, "script_timing") == 0) {
             g_cfg.abScriptTiming = true;
             ab::Configure(f, period, &scripttiming::SetActive);
@@ -922,6 +939,15 @@ void LoadConfig() {
 #endif
         } else if (strcmp(f, "picture") == 0) {
             ab::Configure(f, period, &postfx::SetActive);
+        } else if (strcmp(f, "blend_over_time") == 0) {  // the blend over time on (on) or the plain last pass (off)
+            g_cfg.abBlendOverTime = true;
+            ab::Configure(f, period, &postfx::SetBlendActive);
+        } else if (strcmp(f, "steady_glow") == 0) {  // the steady lamp glow (on) or the game's own glow mask (off)
+            g_cfg.abSteadyGlow = true;
+            ab::Configure(f, period, &postfx::SetSteadyGlowActive);
+        } else if (strcmp(f, "glow_gain") == 0) {  // the limited gain of the lamp glow (on) or the game's blur shaders (off)
+            g_cfg.abGlowGain = true;
+            ab::Configure(f, period, &postfx::SetGlowGainActive);
         } else if (strcmp(f, "override_lock_all") == 0) {
             ab::Configure(f, period, &pipeline::SetOverrideLockAll);
         } else if (strcmp(f, "node_set_skip") == 0) {
@@ -932,9 +958,15 @@ void LoadConfig() {
         } else if (strcmp(f, "function_lookup") == 0) {
             g_cfg.abFunctionLookup = true;
             ab::Configure(f, period, &funclookup::SetActive);
+        } else if (strcmp(f, "control_lookup") == 0) {
+            g_cfg.abControlLookup = true;
+            ab::Configure(f, period, &controllookup::SetActive);
         } else if (strcmp(f, "node_lookup") == 0) {
             g_cfg.abNodeLookup = true;
             ab::Configure(f, period, &nodelookup::SetActive);
+        } else if (strcmp(f, "load_clock") == 0) {  // the engine's tick count (off) or the precise slice clock (on)
+            g_cfg.abLoadClock = true;
+            ab::Configure(f, period, &loadclock::SetActive);
         } else if (strcmp(f, "fast_strings") == 0) {
             g_cfg.abFastStrings = true;
             ab::Configure(f, period, &fastpaths::SetActive);
@@ -1148,6 +1180,25 @@ void InstallD3dIfReady() {
         px.lampFadeFrom = tscfix::config::Int("graphics", "lamp_fade_from_percent", 25, g_cfg.iniPath) / 100.0f;
         px.lampFadeTo = tscfix::config::Int("graphics", "lamp_fade_to_percent", 70, g_cfg.iniPath) / 100.0f;
         px.noLampLight = tscfix::config::Int("experiments", "no_lamp_light", 0, g_cfg.iniPath);
+        // Blend over time (off by default). Under A/B it is installed and stays off until a window switches it.
+        px.blendOverTime = tscfix::config::Int("graphics", "blend_over_time", 0, g_cfg.iniPath) != 0 || g_cfg.abBlendOverTime;
+        px.blendWeight = tscfix::config::Int("experiments", "taa_weight_percent", 75, g_cfg.iniPath) / 100.0f;
+        px.stillMove = tscfix::config::Int("experiments", "taa_still_move_um", 500, g_cfg.iniPath) / 1e6f;
+        px.stillTurn = tscfix::config::Int("experiments", "taa_still_turn_ppm", 100, g_cfg.iniPath) / 1e6f;
+        px.blendLog = tscfix::config::Int("experiments", "taa_log", 0, g_cfg.iniPath) != 0;
+        px.showHistory = tscfix::config::Int("experiments", "taa_show_history", 0, g_cfg.iniPath) != 0;
+        // Steady glow (off by default). Under A/B it is installed and stays off until a window switches it.
+        px.steadyGlow = tscfix::config::Int("graphics", "steady_glow", 0, g_cfg.iniPath);
+        if (g_cfg.abSteadyGlow && px.steadyGlow == 0) px.steadyGlow = 1;
+        px.steadyGlowKeep = tscfix::config::Int("experiments", "steady_glow_keep_percent", 60, g_cfg.iniPath) / 100.0f;
+        px.glowLog = tscfix::config::Int("experiments", "glow_log", 0, g_cfg.iniPath) != 0;
+        // Glow gain (100 = the game's behaviour). Under A/B with no value given it is 20; it stays off until a window switches it.
+        int glowGain = tscfix::config::Int("graphics", "glow_far_gain_percent", 100, g_cfg.iniPath);
+        if (g_cfg.abGlowGain && (glowGain <= 0 || glowGain >= 100)) glowGain = 20;
+        px.glowFarGain = glowGain / 100.0f;
+        if (g_cfg.abGlowGain) postfx::SetGlowGainActive(false);
+        if (g_cfg.abSteadyGlow) postfx::SetSteadyGlowActive(false);
+        if (g_cfg.abBlendOverTime) postfx::SetBlendActive(false);
         postfx::Configure(px);
         r.hooksWanted = postfx::Enabled();
         resolve::Configure(r);
@@ -1203,6 +1254,16 @@ DWORD WINAPI Startup(void*) {
                                  tscfix::config::Int("experiments", "consist_watch", 0, g_cfg.iniPath) != 0;
                     if (sp != 100 || dp != 100 || !on || watch) physicsfix::InstallCabCamera(h, sp, dp, on, watch);
                 }
+                // [fixes] camera_rest (default 1): the standing cab camera keeps its transform bit for bit.
+                if ((tscfix::config::Int("fixes", "camera_rest", 1, g_cfg.iniPath) != 0 || g_cfg.abCameraRest) &&
+                    physicsfix::InstallCameraRest(h, tscfix::config::Int("fixes", "camera_rest_um", 300, g_cfg.iniPath),
+                                                  tscfix::config::Int("fixes", "camera_rest_turn_ppm", 20, g_cfg.iniPath),
+                                                  tscfix::config::Int("experiments", "camera_rest_log", 0, g_cfg.iniPath) != 0) &&
+                    !g_cfg.abCameraRest)
+                    physicsfix::SetCameraRestActive(true);
+                if (tscfix::config::Int("experiments", "sched_watch", 0, g_cfg.iniPath) && schedwatch::Install(h) &&
+                    tscfix::config::Int("experiments", "vehicle_watch", 0, g_cfg.iniPath))
+                    schedwatch::InstallVehicles(h);
                 if ((g_cfg.scriptTiming || g_cfg.abScriptTiming) && scripttiming::Install(h) && !g_cfg.abScriptTiming)
                     scripttiming::SetActive(true);
 #ifdef TSCFIX_SCRIPTCALL
@@ -1235,6 +1296,14 @@ DWORD WINAPI Startup(void*) {
                     if (mode) nodeskip::Install(h, mode);
                     nodeskip::SetCensus(tscfix::config::Int("experiments", "node_census", 0, g_cfg.iniPath) != 0);
                 }
+                {
+                    // [fixes] fast_control_lookup=1 uses remembered answers (default 1); [experiments] control_lookup_verify=1
+                    // only compares them with the engine's lookup. It needs the script call hook ([fixes] script_call_cache).
+                    int mode = tscfix::config::Int("fixes", "fast_control_lookup", 1, g_cfg.iniPath) || g_cfg.abControlLookup ? 2 : 0;
+                    // The verify mode wins over the default, so a check run needs no other switch.
+                    if (tscfix::config::Int("experiments", "control_lookup_verify", 0, g_cfg.iniPath)) mode = 1;
+                    if (mode) controllookup::Install(h, mode);
+                }
 #endif
 #ifdef TSCFIX_QICACHE
                 if ((g_cfg.qiCache || g_cfg.abQiCache) &&
@@ -1253,6 +1322,13 @@ DWORD WINAPI Startup(void*) {
                     if ((g_cfg.fastNodeLookup || g_cfg.abNodeLookup || verify) && nodelookup::Install(h, verify) &&
                         !g_cfg.abNodeLookup)
                         nodelookup::SetActive(true);
+                }
+                {
+                    // (one install for both: the instrument hooks a function that the clock's install reads)
+                    bool clock = g_cfg.preciseLoadClock || g_cfg.abLoadClock;
+                    if ((clock || g_cfg.fiberTime) && loadclock::Install(h, clock, g_cfg.fiberTime) && g_cfg.preciseLoadClock &&
+                        !g_cfg.abLoadClock)
+                        loadclock::SetActive(true);
                 }
                 if (g_cfg.shadowCull || g_cfg.abShadowCull) {
                     g_cfg.cull.cascadeCount = g_cfg.cascadeCount;
